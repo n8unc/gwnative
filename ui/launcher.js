@@ -23,11 +23,89 @@
   let polling = false;
   let saving = false;
   let loginChoiceTouched = false;
+  let groupEditing = null;
+  let groupSaving = false;
+  let groupMembers = [];
+  let enabledPacks = [];
+
+  function orderedRows(container, ids, entries, onChange) {
+    container.replaceChildren();
+    const ordered = [...ids, ...entries.map(e => e.id).filter(id => !ids.includes(id))];
+    for (const id of ordered) {
+      const item = entries.find(e => e.id === id);
+      const row = element('div', 'ordered-row');
+      const check = document.createElement('input'); check.type = 'checkbox'; check.checked = ids.includes(id);
+      check.setAttribute('aria-label', `Enable ${item?.name || id}`);
+      check.onchange = () => { onChange(check.checked ? [...ids, id] : ids.filter(v => v !== id)); };
+      row.append(check, element('span', 'member-name', item?.name || `${id} (missing)`));
+      if (ids.includes(id)) {
+        const index = ids.indexOf(id);
+        for (const [title, delta] of [['↑', -1], ['↓', 1]]) {
+          const move = button(title, () => { const next = [...ids]; [next[index], next[index + delta]] = [next[index + delta], next[index]]; onChange(next); });
+          move.setAttribute('aria-label', `Move ${item?.name || id} ${delta < 0 ? 'up' : 'down'}`);
+          move.disabled = index + delta < 0 || index + delta >= ids.length; row.append(move);
+        }
+      }
+      container.append(row);
+    }
+  }
+  function renderAccountPacks() {
+    orderedRows($('account-textures'), enabledPacks, (snapshot.textureLibrary?.packs || []).map(p => ({ id: p.id, name: `${p.name} · ${p.status}` })), ids => { enabledPacks = ids; renderAccountPacks(); });
+    if (!enabledPacks.length && !(snapshot.textureLibrary?.packs || []).length) $('account-textures').append(element('p', 'hint', 'No texture packs discovered.'));
+    if (enabledPacks.length > 1) {
+      const selection = [...enabledPacks];
+      request('textureConflicts', {packIds: selection}).then(counts => {
+        if (!Array.isArray(counts) || JSON.stringify(selection) !== JSON.stringify(enabledPacks)) return;
+        const total = counts.reduce((sum, count) => sum + count, 0);
+        if (total) $('account-textures').append(element('p', 'hint', `${total} conflicting replacements use the earlier pack in this order.`));
+      }).catch(error => notice(error.message));
+    }
+  }
+  function renderGroupMembers() {
+    orderedRows($('group-members'), groupMembers, snapshot.accounts.map(a => ({id: a.id, name: a.nickname})), ids => { groupMembers = ids; renderGroupMembers(); });
+  }
+  function editGroup(group = null) {
+    groupEditing = group; groupMembers = [...(group?.accountIds || [])];
+    $('group-name').value = group?.name || ''; $('group-error').hidden = true;
+    $('delete-group').hidden = !group; renderGroupMembers(); $('group-editor').showModal(); $('group-name').focus();
+  }
+  function renderPhaseTwo() {
+    $('groups').replaceChildren();
+    for (const group of snapshot.groups || []) {
+      const row = element('div', 'group-row');
+      const names = group.accountIds.map(id => snapshot.accounts.find(a => a.id === id)?.nickname || 'Missing Account');
+      const details = element('div', 'group-details'); details.append(element('strong', '', group.name), element('div', 'hint', names.join(' → ') || 'No members'));
+      if (group.lastLaunch?.length) details.append(element('div', 'hint', group.lastLaunch.map(member => `${member.name}: ${member.status}`).join(' · ')));
+      const launch = button('Launch', async () => {
+        await request('launchGroup', {groupId: group.id});
+        notice(''); changed = ''; await refresh();
+      }, 'primary'); launch.disabled = !group.accountIds.length;
+      row.append(details, launch, button('Edit', () => editGroup(group))); $('groups').append(row);
+    }
+    if (!(snapshot.groups || []).length) $('groups').append(element('p', 'hint', 'Save Accounts in the order you want them to start.'));
+    const library = snapshot.textureLibrary || {};
+    $('texture-folder').textContent = library.folder || '';
+    $('texture-status').textContent = library.message || 'Texture compatibility is checked separately from discovery.';
+    $('texture-library').replaceChildren();
+    for (const pack of library.packs || []) {
+      const row = element('div', 'pack-row'); const details = element('div', 'pack-details');
+      const accounts = snapshot.accounts.filter(a => (a.launchPreferences?.texturePackIds || []).includes(pack.id));
+      details.append(element('strong', '', pack.name), element('span', 'hint', `${pack.status}${pack.error ? ` · ${pack.error}` : ''}${accounts.length ? ` · Used by ${accounts.map(a => a.nickname).join(', ')}` : ''}`));
+      row.append(details); $('texture-library').append(row);
+    }
+  }
+  function launchPreferences() {
+    const fps = $('launch-fps').value.trim();
+    return { muted: $('launch-sound').value === 'default' ? null : $('launch-sound').value === 'muted', frameRateLimit: fps ? { limit: Number(fps) } : 'default', windowMode: $('launch-mode').value === 'default' ? null : $('launch-mode').value, preferredCharacter: $('preferred-character').value.trim() || null, texturePackIds: enabledPacks };
+  }
+  function fixedFrame() {
+    return $('launch-layout').value === 'fixed' ? Object.fromEntries(['x', 'y', 'width', 'height'].map(key => [key, Number($(`layout-${key}`).value)])) : null;
+  }
 
   function request(action, values = {}) {
     return new Promise((resolve, reject) => {
       const id = ++serial;
-      const timeout = setTimeout(() => { pending.delete(id); reject(new Error('The launcher did not respond. Please try again.')); }, 30_000);
+      const timeout = action === 'changeTextureFolder' ? null : setTimeout(() => { pending.delete(id); reject(new Error('The launcher did not respond. Please try again.')); }, 30_000);
       pending.set(id, { resolve, reject, timeout });
       try { window.webkit.messageHandlers.launcher.postMessage(JSON.stringify({ id, action, ...values })); }
       catch { clearTimeout(timeout); pending.delete(id); reject(new Error('The native launcher connection is unavailable.')); }
@@ -52,7 +130,7 @@
     node.onclick = () => Promise.resolve().then(run).catch((error) => notice(error.message));
     return node;
   }
-  async function act(action, values) { await request(action, values); changed = ''; await refresh(); }
+  async function act(action, values) { const result = await request(action, values); if (result?.members) notice(result.members.map(m => `${m.name}: ${m.status}`).join(' · ')); changed = ''; await refresh(); }
   function selection() {
     const ids = model.selectedLaunches(snapshot.accounts, selected);
     $('launch-selected').disabled = !ids.length;
@@ -86,6 +164,7 @@
       details.append(element('div', 'account-name', account.nickname), element('div', 'account-email', account.email));
       const status = element('div', `account-status ${account.status === 'running' ? 'active' : account.status === 'failed' || account.status === 'attention' ? 'error' : ''}`, account.statusLabel || 'Ready');
       status.setAttribute('role', 'status'); details.append(status);
+      if (account.launchWarning) details.append(element('div', 'account-status error', account.launchWarning));
       const toggles = element('div', 'row-toggles'); toggles.append(toggle(account, 'autoLogin', 'Auto-login'), toggle(account, 'autoLaunch', 'Auto-launch')); details.append(toggles);
       const actions = element('div', 'row-actions');
       const play = button('Play', () => act('play', { accountIds: [account.id] }), 'primary'); play.disabled = !model.canPlay(account); actions.append(play);
@@ -99,6 +178,7 @@
       row.append(check, avatar, details, actions); $('accounts').append(row);
     }
     selection();
+    renderPhaseTwo();
   }
   async function refresh() {
     if (polling) return;
@@ -108,8 +188,8 @@
       snapshot = next;
       $('update-status').textContent = next.updateMessage || 'Game content shared across all accounts';
       $('check-updates').disabled = Boolean(next.updating);
-      const key = JSON.stringify(next.accounts);
-      if (key !== changed && !saving) { changed = key; render(); }
+      const key = JSON.stringify([next.accounts, next.groups, next.textureLibrary]);
+      if (key !== changed && !saving) { changed = key; render(); if ($('editor').open) renderAccountPacks(); }
     } catch (error) { notice(error.message); }
     finally { polling = false; }
   }
@@ -129,6 +209,20 @@
     $('email').value = account?.email || profile?.email || '';
     $('auto-login').checked = model.savedAutoLogin({ editing: account, adopting: profile });
     $('auto-launch').checked = Boolean(account?.autoLaunch);
+    const prefs = account?.launchPreferences || {};
+    $('launch-sound').value = prefs.muted == null ? 'default' : prefs.muted ? 'muted' : 'on';
+    $('launch-fps').value = prefs.frameRateLimit?.limit ? String(prefs.frameRateLimit.limit) : '';
+    $('launch-mode').value = prefs.windowMode || 'default';
+    $('preferred-character').value = prefs.preferredCharacter || '';
+    $('last-seen-characters').replaceChildren(...(account?.lastSeenCharacters || []).map(name => {
+      const option = document.createElement('option'); option.value = name; option.label = `Last seen — ${name}`; return option;
+    }));
+    const frame = account?.windowPreferences?.fixedLaunchFrame;
+    $('launch-layout').value = frame ? 'fixed' : 'restore'; $('layout-values').hidden = !frame;
+    for (const key of ['x', 'y', 'width', 'height']) $(`layout-${key}`).value = String(frame?.[key] ?? ({x: 0, y: 0, width: 1280, height: 800}[key]));
+    $('capture-layout').disabled = account?.status !== 'running';
+    $('next-launch-hint').textContent = account && model.busy(account) ? 'Game is open or queued. These edits apply to its next launch.' : 'Applied on next launch.';
+    enabledPacks = [...(prefs.texturePackIds || [])]; renderAccountPacks();
     $('remove-password-row').hidden = !account?.hasPassword;
     $('password-hint').textContent = account?.hasPassword ? 'Leave blank to keep your saved password.' : 'Stored securely in macOS Keychain.';
     const busy = account && model.busy(account);
@@ -157,6 +251,7 @@
     const removePassword = $('remove-password').checked;
     const emailChanged = originalEmail && email.toLowerCase() !== originalEmail.toLowerCase();
     const values = { accountId: editing?.id, profileId: adopting?.profileId, nickname: $('nickname').value.trim(), email, autoLogin: !removePassword && !emailChanged && $('auto-login').checked, autoLaunch: $('auto-launch').checked, removePassword };
+    values.launchPreferences = launchPreferences(); values.fixedLaunchFrame = fixedFrame();
     if (emailChanged) {
       if (!await confirm('Change this login?', 'This Account keeps its existing private files. Its old password will be cleared and Auto-login turned off. For a separate game account, use Add Account.')) return;
       values.preserveContext = true;
@@ -204,5 +299,35 @@
     } catch (error) { notice(error.message); }
   };
   $('close-imports').onclick = () => $('imports').close();
+  $('launch-layout').onchange = () => { $('layout-values').hidden = $('launch-layout').value !== 'fixed'; };
+  $('capture-layout').onclick = async () => {
+    const accountId = editing?.id; if (!accountId) return;
+    $('capture-layout').disabled = true;
+    try {
+      const result = await request('captureLayout', {accountId});
+      if (editing?.id !== accountId || !$('editor').open) return;
+      const frame = result.frame;
+      if (!frame) throw new Error('Window layout capture is pending. Try again once the game responds.');
+      $('launch-layout').value = 'fixed'; $('layout-values').hidden = false;
+      for (const key of ['x', 'y', 'width', 'height']) $(`layout-${key}`).value = String(frame[key]);
+    } catch (error) { if (editing?.id === accountId) { $('form-error').textContent = error.message; $('form-error').hidden = false; } }
+    finally { if (editing?.id === accountId) $('capture-layout').disabled = snapshot.accounts.find(a => a.id === accountId)?.status !== 'running'; }
+  };
+  $('new-group').onclick = () => editGroup();
+  $('cancel-group').onclick = () => $('group-editor').close();
+  $('group-form').onsubmit = async event => {
+    event.preventDefault(); if (groupSaving) return; groupSaving = true; $('save-group').disabled = true;
+    try { await act('saveGroup', {groupId: groupEditing?.id, name: $('group-name').value.trim(), accountIds: groupMembers}); $('group-editor').close(); }
+    catch (error) { $('group-error').textContent = error.message; $('group-error').hidden = false; }
+    finally { groupSaving = false; $('save-group').disabled = false; }
+  };
+  $('delete-group').onclick = async () => {
+    if (!await confirm('Delete this group?', 'Accounts and running games are kept.', 'Delete group')) return;
+    try { await act('deleteGroup', {groupId: groupEditing.id}); $('group-editor').close(); }
+    catch (error) { $('group-error').textContent = error.message; $('group-error').hidden = false; }
+  };
+  $('refresh-textures').onclick = () => act('refreshTextures').catch(error => notice(error.message));
+  $('open-textures').onclick = () => act('openTextureFolder').catch(error => notice(error.message));
+  $('change-textures').onclick = () => act('changeTextureFolder').catch(error => notice(error.message));
   refresh(); setInterval(refresh, 1000);
 })();

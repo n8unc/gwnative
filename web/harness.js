@@ -134,6 +134,12 @@ const scrubDiagnostic = (value) => {
 let client;
 let frameAudit = null;
 let bootProof = Promise.resolve(true);
+let characterObservation;
+let startupCharacterBridge;
+function cancelCharacterStartup() {
+  characterObservation?.abort();
+  startupCharacterBridge?.dispose();
+}
 window.gwFlushBootProof = async () => {
   const booted = await bootProof;
   const response = await fetch('__proof-flush', {
@@ -262,7 +268,10 @@ let bootRescueActive = true;
       frameAudit?.endAnimationFrame(frame);
     }
   };
-  let lastFrame = Number.NEGATIVE_INFINITY;
+  // A native animation frame may contain several client callbacks. The cap
+  // admits that whole timestamp as one game frame; otherwise one chain wins
+  // first and starves every callback queued alongside it.
+  let lastAcceptedFrame = Number.NEGATIVE_INFINITY;
   window.requestAnimationFrame = (callback) => {
     if (!bootRescueActive) {
       if (!requestedFrameMs && !frameAudit?.enabled) {
@@ -270,22 +279,21 @@ let bootRescueActive = true;
         // good unless a compatibility cap or diagnostic run needs callback
         // boundaries.
         window.requestAnimationFrame = raf;
-        raf(callback);
-        return 0;
+        return raf(callback);
       }
       if (!requestedFrameMs) {
         return raf((timestamp) => invoke(callback, timestamp));
       }
       const limited = (timestamp) => {
-        if (timestamp - lastFrame + 0.05 >= requestedFrameMs) {
-          lastFrame = timestamp;
+        if (timestamp === lastAcceptedFrame
+          || timestamp - lastAcceptedFrame + 0.05 >= requestedFrameMs) {
+          lastAcceptedFrame = timestamp;
           invoke(callback, timestamp);
         } else {
           raf(limited);
         }
       };
-      raf(limited);
-      return 0;
+      return raf(limited);
     }
     let taken = false;
     const run = (timestamp) => {
@@ -348,6 +356,7 @@ const status = (text, fraction = null, detail = '', force = false) => {
  * status line, which is what this used to be in every case.
  */
 const fail = (text) => {
+  cancelCharacterStartup();
   status(text, null, '', true);
   log('[err]', text);
   recovery?.showFailure(text, log, () =>
@@ -610,6 +619,33 @@ Module = {
       log,
     });
 
+    try {
+      const seam = host.installTexturePacks({
+        manifest: window.__gwnativeTextureManifest, imports, module: Module, log,
+        diagnostics: launchOptions.diagnostics === true,
+      });
+      window.__gwnativeTextureDiagnostics = seam?.snapshot ?? (() => ({ mappings: 0, replacements: 0 }));
+      if (launchOptions.diagnostics === true) {
+        for (const delay of [10000, 30000, 60000]) {
+          setTimeout(() => {
+            log('[textures] upload counts:', JSON.stringify(window.__gwnativeTextureDiagnostics()));
+            const exports = gameInstance?.exports;
+            if (typeof exports?.GwnativeCharacterRosterCount === 'function'
+                && typeof exports?.GwnativeCharacterReadiness === 'function') {
+              log('[character] observation:', JSON.stringify({
+                count: exports.GwnativeCharacterRosterCount(),
+                readiness: exports.GwnativeCharacterReadiness(),
+                uiReady: typeof exports.GwnativeCharacterUiReady === 'function'
+                  ? exports.GwnativeCharacterUiReady() : null,
+                ticks: typeof exports.GwnativeCharacterTickCount === 'function'
+                  ? exports.GwnativeCharacterTickCount() : null,
+              }));
+            }
+          }, delay);
+        }
+      }
+    } catch (error) { log('[textures] replacements bypassed:', error); }
+
     performance.mark('gw.wasm.instantiate.begin');
     (async () => {
       const instantiate = async (source) => {
@@ -638,6 +674,33 @@ Module = {
       );
       log('wasm instantiated');
       gameInstance = result.instance;
+      if (typeof gameInstance.exports.GwnativeCharacterReadiness === 'function') {
+        const rosterObservation = new AbortController();
+        characterObservation = rosterObservation;
+        window.addEventListener('pagehide', () => rosterObservation.abort(), { once: true });
+        void host.observeCharacterNames({
+          exports: gameInstance.exports, module: Module,
+          sessionId: window.__gwnativeLaunchNonce, signal: rosterObservation.signal,
+          publish: body => host.postRuntimeState('/__character-observations', body, {
+            token: window.__gwnativeGamePublisherToken,
+          }),
+        }).catch(() => log('[character] last-seen list unavailable'));
+      }
+      if (window.__gwnativePreferredCharacter) {
+        const bridge = window.__gwnativeCharacterCapability?.supported === true
+          ? host.createCharacterAdapter({ exports: gameInstance.exports, module: Module,
+            sessionId: window.__gwnativeLaunchNonce, inputTarget: window, log }) : null;
+        startupCharacterBridge = bridge;
+        void host.startPreferredCharacter({
+          sessionId: window.__gwnativeLaunchNonce,
+          runtime: client?.mode,
+          clientBuild: String(window.__gwnativeClientBuild ?? ''),
+          capability: window.__gwnativeCharacterCapability,
+          bridge,
+          preferredCharacter: window.__gwnativePreferredCharacter,
+        }).then(result => { window.__gwnativeCharacterStatus = result; log('[character]', result.reason || result.outcome); })
+          .finally(() => bridge?.dispose());
+      }
       // Before the glue resumes constructors/main: the client builds its login
       // UI only once. Keychain values stay on secureStorage; this enables only
       // the certified per-instance request gate. The client's own auto-login
@@ -790,10 +853,15 @@ Module = {
   },
 
   onAbort(reason) {
+    if (String(reason).includes('evt.buttonState')) {
+      const transitions = window.gwInput?.getMouseDiagnostics?.();
+      if (transitions) log('[input] mouse transitions before abort:', JSON.stringify(transitions));
+    }
     runtimeFailedBeforeProof(reason);
   },
 
   onExit(code) {
+    cancelCharacterStartup();
     log('wasm exited:', code);
     if (code !== 0) {
       runtimeFailedBeforeProof(`the client exited with status ${code}`);
@@ -858,6 +926,7 @@ function appendGlue() {
 }
 
 function runtimeFailedBeforeProof(reason) {
+  cancelCharacterStartup();
   const message = reason?.message ?? String(reason);
   runtimeLifecycle.fail(message).catch((error) => {
     fail(error?.message ?? String(error));
@@ -880,7 +949,7 @@ function runtimeFailedBeforeProof(reason) {
   try {
     const [
       graphics, audio, memory, filesystem, image, sockets, platform, input, templates, prefs,
-      start, panel, data, compat, guide, gameApi, metrics, runtime, audit, imageReads, launcherCredentials,
+      start, panel, data, compat, guide, gameApi, metrics, runtime, audit, imageReads, launcherCredentials, textures, characterStartup, characterAdapter,
     ] = await Promise.all([
       import('./graphics.js'),
       import('./audio.js'),
@@ -903,9 +972,15 @@ function runtimeFailedBeforeProof(reason) {
       import('./frame-audit.js'),
       import('./image-read-tracking.js'),
       import('./launcher-credentials.js'),
+      import('./texture-packs.js'),
+      import('./character-startup.js'),
+      import('./character-adapter.js'),
     ]);
     host = {
       ...launcherCredentials,
+      ...textures,
+      ...characterStartup,
+      ...characterAdapter,
       ...graphics,
       ...audio,
       ...memory,
@@ -977,11 +1052,11 @@ function runtimeFailedBeforeProof(reason) {
     client,
     target: window,
     relaunch: host.relaunchApp,
-    onTransition: () => status('Trying the other official runtime…'),
-    onOriginalFallback: (error) => log(
-      '[warn] certified client could not instantiate; retrying ArenaNet’s exact module:',
-      error,
-    ),
+    onTransition: () => { cancelCharacterStartup(); status('Trying the other official runtime…'); },
+    onOriginalFallback: (error) => {
+      cancelCharacterStartup();
+      log('[warn] certified client could not instantiate; retrying ArenaNet’s exact module:', error);
+    },
   });
   log(
     `client runtime: ${client.mode}`,

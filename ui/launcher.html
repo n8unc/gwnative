@@ -17,6 +17,8 @@
   <main>
     <div class="list-heading"><span id="account-count">Accounts</span><span class="hint">Separate settings · Shared game content</span></div>
     <div id="accounts" aria-label="Accounts"></div>
+    <section class="phase-section" aria-labelledby="groups-title"><div class="list-heading"><h2 id="groups-title">Launch groups</h2><button id="new-group">New group</button></div><div id="groups"></div></section>
+    <section class="phase-section" aria-labelledby="textures-title"><div class="list-heading"><h2 id="textures-title">Texture library</h2><div><button id="refresh-textures">Refresh</button><button id="open-textures">Open folder</button><button id="change-textures">Change folder…</button></div></div><p id="texture-folder" class="hint"></p><p id="texture-status" class="hint"></p><div id="texture-library"></div></section>
     <div id="empty" hidden><div class="empty-mark">◇</div><h2>A place for every account</h2><p>Add your Guild Wars login to get started.<br>Your game files stay shared; your settings stay yours.</p><button id="empty-add" class="primary">Add your first Account</button></div>
   </main>
   <footer><button id="launch-selected" disabled class="primary">Launch selected</button><span id="selection-count" class="hint">Select accounts to launch together</span><div class="footer-menu"><button id="adopt" class="quiet">Import existing…</button><button id="quit-all" class="quiet">Quit all…</button></div></footer>
@@ -31,10 +33,21 @@
       <label class="check" id="remove-password-row" hidden><input id="remove-password" type="checkbox">Remove saved password</label>
       <label class="check"><input id="auto-login" type="checkbox" disabled>Auto-login <span class="hint">Sign in automatically when the game starts.</span></label>
       <label class="check"><input id="auto-launch" type="checkbox">Auto-launch <span class="hint">Start when the launcher opens</span></label>
+      <fieldset class="launch-settings"><legend>Launch settings</legend><p id="next-launch-hint" class="hint">Applied on next launch.</p>
+      <label for="launch-sound">Sound</label><select id="launch-sound"><option value="default">Use default</option><option value="on">On</option><option value="muted">Muted</option></select>
+      <label for="launch-fps">Frame-rate limit <span class="hint">blank uses default</span></label><input id="launch-fps" type="number" min="1" max="1000" step="1" placeholder="Default">
+      <label for="launch-mode">Window mode</label><select id="launch-mode"><option value="default">Use default</option><option value="windowed">Windowed</option><option value="fullscreen">Fullscreen</option></select>
+      <label for="launch-layout">Window layout</label><select id="launch-layout"><option value="restore">Restore last layout</option><option value="fixed">Fixed size and position</option></select>
+      <div id="layout-values" class="geometry" hidden><label>X<input id="layout-x" type="number" step="1"></label><label>Y<input id="layout-y" type="number" step="1"></label><label>Width<input id="layout-width" type="number" min="800" max="32768" step="1"></label><label>Height<input id="layout-height" type="number" min="600" max="32768" step="1"></label></div>
+      <p class="hint">Sizes use macOS points. Fullscreen retains windowed layout.</p><button type="button" id="capture-layout" disabled>Use current window layout</button>
+      <label for="preferred-character">Preferred character</label><input id="preferred-character" list="last-seen-characters" maxlength="64" autocomplete="off" placeholder="Stop at character selection"><datalist id="last-seen-characters"></datalist><p id="character-support" class="hint">On supported client builds, selects this character and enters after sign-in. Other builds stay at character selection.</p>
+      <label>Texture packs</label><p class="hint">Top pack wins conflicts. Changes apply next launch.</p><div id="account-textures"></div>
+      </fieldset>
       <p id="form-error" role="alert" hidden></p>
       <div class="dialog-actions"><button type="button" id="remove-account" class="danger" hidden>Remove…</button><span class="spacer"></span><button type="button" id="cancel-edit">Cancel</button><button type="submit" id="save" class="primary">Save Account</button></div>
     </form>
   </dialog>
+  <dialog id="group-editor" aria-labelledby="group-title"><form id="group-form"><h2 id="group-title">Launch group</h2><label for="group-name">Name</label><input id="group-name" required maxlength="80"><p class="hint">Select members and arrange launch order. Each Account uses its own settings.</p><div id="group-members"></div><p id="group-error" role="alert" hidden></p><div class="dialog-actions"><button type="button" id="delete-group" class="danger" hidden>Delete</button><span class="spacer"></span><button type="button" id="cancel-group">Cancel</button><button type="submit" id="save-group" class="primary">Save group</button></div></form></dialog>
   <dialog id="confirmation" aria-labelledby="confirm-title"><h2 id="confirm-title"></h2><p id="confirm-message"></p><div id="confirm-options"></div><div class="dialog-actions"><button id="confirm-cancel">Cancel</button><button id="confirm-yes" class="primary">Continue</button></div></dialog>
   <dialog id="imports" aria-labelledby="imports-title"><h2 id="imports-title">Existing profiles</h2><p class="hint">Choose a profile to review. Importing never starts a game.</p><div id="import-list"></div><div class="dialog-actions"><button id="close-imports">Done</button></div></dialog>
   <script>/* LAUNCHER_SCRIPT */</script>

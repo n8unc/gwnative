@@ -71,7 +71,7 @@ const callbackModule = new WebAssembly.Module(Uint8Array.from([
   7, 5, 1, 1, 102, 0, 0,
 ]));
 
-function probe(args) {
+function probe(args, inspect = false) {
   let exports;
   const imports = {};
   let importCalls = 0;
@@ -130,6 +130,17 @@ function probe(args) {
     autoLogin: exports.optionValue(parser, 1),
     unknown,
   };
+  if (inspect) {
+    result.character = utf16(exports.optionValue(parser, 46));
+    const words = new Uint32Array(exports.memory.buffer);
+    result.descriptors = Array.from({ length: 52 }, (_, id) => {
+      const at = 1452944 / 4 + id * 3;
+      const pointer = words[at + 1];
+      let name = null;
+      try { name = pointer ? utf16(pointer) : null; } catch {}
+      return [id, words[at], pointer, words[at + 2], name];
+    });
+  }
   assert.equal(importCalls, constructorCalls, 'Parser unexpectedly requested a host operation');
   return result;
 }
@@ -165,4 +176,11 @@ for (const [label, args, expected] of cases) {
   assert.deepEqual(probe(args), expected, label);
   console.log(`PASS ${label}`);
 }
+for (const option of ['character', 'charname', 'charactername', 'char']) {
+  const plain = probe([`--${option}=Fixture`], true);
+  const spaced = probe([`--${option}=Fixture User`], true);
+  const single = probe([`-${option}`, 'Fixture'], true);
+  console.log(`OPTION ${option} plain=${plain.parseResult}/${JSON.stringify(plain.unknown)}/${JSON.stringify(plain.character)} single=${single.parseResult}/${JSON.stringify(single.unknown)}/${JSON.stringify(single.character)} spaced=${spaced.parseResult}/${JSON.stringify(spaced.unknown)}/${JSON.stringify(spaced.character)}`);
+}
+console.log(`DESCRIPTORS ${JSON.stringify(probe([], true).descriptors)}`);
 console.log(`${cases.length} parser checks passed. No game startup, credentials read, or network access.`);

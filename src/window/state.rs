@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 /// build does not know is refused rather than reinterpreted, and a refused file
 /// costs a default window rather than a window placed from a shape nothing
 /// understood.
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 
 /// The window a first launch gets, before it has been anywhere.
 const DEFAULT_SIZE: (f64, f64) = (1280.0, 800.0);
@@ -45,7 +45,7 @@ const DEFAULT_MARGIN: f64 = 64.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub(super) enum Mode {
+pub(crate) enum Mode {
     Normal,
     Maximized,
     Fullscreen,
@@ -57,15 +57,15 @@ pub(super) enum Mode {
 /// or top-left form, because every producer and consumer here is AppKit and a
 /// conversion is one more place to have the sign wrong.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub(super) struct Bounds {
-    pub(super) x: f64,
-    pub(super) y: f64,
-    pub(super) width: f64,
-    pub(super) height: f64,
+pub(crate) struct Bounds {
+    pub(crate) x: f64,
+    pub(crate) y: f64,
+    pub(crate) width: f64,
+    pub(crate) height: f64,
 }
 
 impl Bounds {
-    pub(super) fn from_rect(rect: NSRect) -> Self {
+    pub(crate) fn from_rect(rect: NSRect) -> Self {
         Self {
             x: rect.origin.x,
             y: rect.origin.y,
@@ -74,7 +74,7 @@ impl Bounds {
         }
     }
 
-    pub(super) fn to_rect(self) -> NSRect {
+    pub(crate) fn to_rect(self) -> NSRect {
         NSRect::new(
             NSPoint::new(self.x, self.y),
             NSSize::new(self.width, self.height),
@@ -90,85 +90,128 @@ impl Bounds {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct State {
-    pub(super) bounds: Bounds,
-    pub(super) mode: Mode,
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct State {
+    pub(crate) bounds: Bounds,
+    pub(crate) mode: Mode,
 }
 
-/// Every field optional so serde's type checking does the rejecting, and a
-/// `formatVersion` from a later build is caught before any of it is believed.
-#[derive(Deserialize)]
+/// Version two separates game observations from launcher-owned preferences.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct Wire {
-    format_version: Option<u32>,
-    bounds: Option<Bounds>,
-    mode: Option<Mode>,
+pub(crate) struct Preferences {
+    pub last_observed_frame: Option<State>,
+    pub fixed_launch_frame: Option<Bounds>,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct Written {
-    format_version: u32,
-    bounds: Bounds,
-    mode: Mode,
-}
-
-/// Read a stored state, or nothing.
-///
-/// A file that cannot be read is removed rather than left to be re-read and
-/// re-rejected on every launch: it has already failed to mean anything, and the
-/// next save writes a version that does.
-pub(super) fn load(path: &Path) -> Option<State> {
-    let text = std::fs::read_to_string(path).ok()?;
-    match parse(&text) {
-        Ok(state) => Some(state),
-        Err(reason) => {
-            note!("[window] ignoring {}: {reason}", path.display());
-            let _ = std::fs::remove_file(path);
-            None
-        }
-    }
-}
-
-fn parse(text: &str) -> Result<State, String> {
-    let wire: Wire = serde_json::from_str(text).map_err(|e| e.to_string())?;
-    if let Some(version) = wire.format_version
-        && version != FORMAT
-    {
-        return Err(format!("formatVersion {version} is not readable"));
-    }
-    let bounds = wire.bounds.ok_or_else(|| "no bounds".to_owned())?;
-    let mode = wire.mode.ok_or_else(|| "no mode".to_owned())?;
-    let sane = [bounds.x, bounds.y, bounds.width, bounds.height]
+pub(crate) fn validate_frame(bounds: Bounds) -> Result<(), String> {
+    if ![bounds.x, bounds.y, bounds.width, bounds.height]
         .iter()
-        .all(|value| value.is_finite());
-    if !sane || bounds.width <= 0.0 || bounds.height <= 0.0 {
-        return Err(format!("bounds {bounds:?} are not a rectangle"));
+        .all(|v| v.is_finite())
+        || bounds.width <= 0.0
+        || bounds.height <= 0.0
+        || bounds.width > MAX_EDGE
+        || bounds.height > MAX_EDGE
+        || bounds.x.abs() > 1_000_000.0
+        || bounds.y.abs() > 1_000_000.0
+    {
+        return Err("Window bounds are not a usable rectangle".into());
     }
-    if bounds.width > MAX_EDGE || bounds.height > MAX_EDGE {
-        return Err(format!("bounds {bounds:?} are implausibly large"));
-    }
-    Ok(State { bounds, mode })
+    Ok(())
 }
 
-/// Write `state`, atomically enough that a crash mid-write cannot leave a file
-/// that parses as something else.
-pub(super) fn save(path: &Path, state: State) {
-    let written = Written {
-        format_version: FORMAT,
-        bounds: state.bounds,
-        mode: state.mode,
+fn parse_preferences(text: &str) -> Result<Preferences, String> {
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    let version = value
+        .get("formatVersion")
+        .map(|v| v.as_u64().ok_or("Invalid window format"))
+        .transpose()?
+        .unwrap_or(1);
+    let prefs = match version {
+        1 => Preferences {
+            last_observed_frame: Some(serde_json::from_value(value).map_err(|e| e.to_string())?),
+            fixed_launch_frame: None,
+        },
+        2 => serde_json::from_value::<Preferences>(value).map_err(|e| e.to_string())?,
+        _ => return Err(format!("formatVersion {version} is not readable")),
     };
-    let Ok(json) = serde_json::to_vec(&written) else {
-        return;
-    };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    if let Some(state) = prefs.last_observed_frame {
+        validate_frame(state.bounds)?;
     }
+    if let Some(bounds) = prefs.fixed_launch_frame {
+        validate_frame(bounds)?;
+    }
+    Ok(prefs)
+}
+
+pub(crate) fn preferences(path: &Path) -> Preferences {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| parse_preferences(&text).ok())
+        .unwrap_or_default()
+}
+
+pub(crate) fn launch_snapshot(path: &Path) -> Option<State> {
+    let prefs = preferences(path);
+    match (prefs.fixed_launch_frame, prefs.last_observed_frame) {
+        (Some(bounds), observed) => Some(State {
+            bounds,
+            mode: observed.map_or(Mode::Normal, |s| s.mode),
+        }),
+        (None, observed) => observed,
+    }
+}
+
+pub(crate) fn load(path: &Path) -> Option<State> {
+    launch_snapshot(path)
+}
+
+#[cfg(test)]
+fn parse(text: &str) -> Result<State, String> {
+    parse_preferences(text)?
+        .last_observed_frame
+        .ok_or_else(|| "no observed frame".into())
+}
+
+fn update(path: &Path, change: impl FnOnce(&mut Preferences)) -> Result<(), String> {
+    use std::io::Write;
+    let _lock = crate::instance::acquire(
+        &path.with_extension("lock"),
+        std::time::Duration::from_secs(2),
+    )?;
+    let mut prefs = preferences(path);
+    change(&mut prefs);
+    let mut value = serde_json::to_value(prefs).map_err(|e| e.to_string())?;
+    value["formatVersion"] = FORMAT.into();
+    let bytes = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
     let temporary = path.with_extension("json.tmp");
-    if std::fs::write(&temporary, &json).is_ok() {
-        let _ = std::fs::rename(&temporary, path);
+    let mut file = std::fs::File::create(&temporary).map_err(|e| e.to_string())?;
+    file.write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|e| e.to_string())?;
+    std::fs::rename(&temporary, path).map_err(|e| e.to_string())?;
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+pub(crate) fn set_fixed_frame(path: &Path, frame: Option<Bounds>) -> Result<(), String> {
+    if let Some(frame) = frame {
+        validate_frame(frame)?;
+    }
+    update(path, |prefs| prefs.fixed_launch_frame = frame)
+}
+
+/// Read and merge under the same process-shared lock as preference writes.
+pub(crate) fn save(path: &Path, state: State) {
+    if validate_frame(state.bounds).is_err() {
+        return;
+    }
+    if let Err(reason) = update(path, |prefs| prefs.last_observed_frame = Some(state)) {
+        note!("[window] could not save {}: {reason}", path.display());
     }
 }
 
@@ -179,7 +222,7 @@ pub(super) fn save(path: &Path, state: State) {
 /// remembered size rather than being dragged to the nearest edge, because a
 /// window that reappears in the middle of a screen reads as "the app opened"
 /// and a window jammed into a corner reads as a bug.
-pub(super) fn fit(state: State, areas: &[Bounds], primary: Bounds) -> State {
+pub(crate) fn fit(state: State, areas: &[Bounds], primary: Bounds) -> State {
     let best = areas
         .iter()
         .map(|area| (*area, state.bounds.overlap(*area)))
@@ -212,7 +255,7 @@ pub(super) fn fit(state: State, areas: &[Bounds], primary: Bounds) -> State {
 
 /// The window a profile with no stored state gets: centred on the primary work
 /// area, at the default size or as much of it as fits.
-pub(super) fn default_state(primary: Bounds) -> State {
+pub(crate) fn default_state(primary: Bounds) -> State {
     let width = DEFAULT_SIZE
         .0
         .min((primary.width - DEFAULT_MARGIN).max(MIN_SIZE.0.min(primary.width)));
@@ -234,7 +277,7 @@ pub(super) fn default_state(primary: Bounds) -> State {
 ///
 /// `visibleFrame`, not `frame`: it excludes the menu bar and the Dock, so a
 /// window placed inside it is a window whose titlebar can be grabbed.
-pub(super) fn work_areas(mtm: MainThreadMarker) -> (Vec<Bounds>, Bounds) {
+pub(crate) fn work_areas(mtm: MainThreadMarker) -> (Vec<Bounds>, Bounds) {
     let screens = NSScreen::screens(mtm);
     let areas: Vec<Bounds> = screens
         .iter()
@@ -331,7 +374,7 @@ mod tests {
     fn a_file_that_cannot_be_believed_is_refused_rather_than_repaired() {
         assert!(parse("{}").is_err(), "no bounds and no mode");
         assert!(
-            parse(r#"{"formatVersion":2,"bounds":{"x":0,"y":0,"width":800,"height":600},"mode":"normal"}"#)
+            parse(r#"{"formatVersion":3,"bounds":{"x":0,"y":0,"width":800,"height":600},"mode":"normal"}"#)
                 .is_err(),
             "a later format is not reinterpreted"
         );
@@ -375,11 +418,38 @@ mod tests {
         save(&path, state);
         assert_eq!(load(&path), Some(state));
 
-        // And a file that cannot be read does not survive to be re-read.
+        // Malformed files fall back safely and remain available for diagnosis.
         std::fs::write(&path, b"{").unwrap();
         assert_eq!(load(&path), None);
-        assert!(!path.exists(), "a refused file is removed, not kept");
+        assert!(
+            path.exists(),
+            "unreadable files remain available for diagnosis"
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preferences_survive_game_observations_and_restore_mode_preserves_last_frame() {
+        let scratch = crate::scratch::TempDir::new("window-preferences");
+        let path = scratch.0.join("window.json");
+        let first = State {
+            bounds: area(10.0, 20.0, 900.0, 700.0),
+            mode: Mode::Normal,
+        };
+        std::fs::write(&path, serde_json::to_vec(&first).unwrap()).unwrap();
+        assert_eq!(preferences(&path).last_observed_frame, Some(first));
+        let fixed = area(100.0, 100.0, 1000.0, 750.0);
+        set_fixed_frame(&path, Some(fixed)).unwrap();
+        let later = State {
+            bounds: area(20.0, 30.0, 1100.0, 800.0),
+            mode: Mode::Fullscreen,
+        };
+        save(&path, later);
+        assert_eq!(preferences(&path).fixed_launch_frame, Some(fixed));
+        assert_eq!(load(&path).unwrap().bounds, fixed);
+        set_fixed_frame(&path, None).unwrap();
+        assert_eq!(load(&path), Some(later));
+        assert!(set_fixed_frame(&path, Some(area(0.0, 0.0, f64::NAN, 100.0))).is_err());
     }
 
     #[test]

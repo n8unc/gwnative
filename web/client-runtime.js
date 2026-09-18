@@ -156,6 +156,15 @@ export function applyClientLimits(client, settings, target = globalThis) {
   const selected = target.__gwnativeRuntimeCapabilities?.[client.mode];
   const wanted = settings.nativeCursor === true || settings.targetReadout === true;
   target.__gwnativeClientBuild = selected?.build ?? null;
+  target.__gwnativePreparedTransform = selected?.preparedTransform
+    ?? (selected?.templateSave === 'ready' || selected?.characterStartup === true);
+  target.__gwnativeCharacterCapability = {
+    supported: selected?.characterStartup === true && typeof selected?.build === 'string',
+    runtime: client.mode, build: selected?.build ?? '',
+    operations: selected?.characterStartup === true ? [
+      'observeReady', 'readRoster', 'selectCharacter', 'readSelected', 'enterCharacter', 'observeEntered',
+    ] : [],
+  };
   target.__gwnativeTemplateSave = selected?.templateSave ?? 'uncertified';
   target.__gwnativeEnhancements = selected?.enhancements ?? (wanted ? 'uncertified' : 'off');
   target.__gwnativeEnhancementManifest = selected?.enhancementManifest ?? null;
@@ -311,7 +320,8 @@ export function createRuntimeLifecycle({
     if (startPromise) return startPromise;
     if (terminal) return Promise.reject(stoppedError ?? new Error('runtime launch stopped'));
     startPromise = persistAttempt(
-      target.__gwnativeTemplateSave === 'ready'
+      (target.__gwnativePreparedTransform
+        ?? (target.__gwnativeTemplateSave === 'ready' || target.__gwnativeCharacterCapability?.supported === true))
         && typeof target.__gwnativeClientBuild === 'string',
     ).then((launch) => {
       if (terminal || stoppedError) throw stoppedError ?? new Error('runtime launch stopped');
@@ -336,8 +346,10 @@ export function createRuntimeLifecycle({
         await transformFailurePromise;
         if (terminal || firstFrameSeen) throw stoppedError ?? error;
         target.__gwnativeTemplateSave = 'failed';
+        target.__gwnativePreparedTransform = false;
         target.__gwnativeEnhancements = 'off';
         target.__gwnativeEnhancementManifest = null;
+        target.__gwnativeCharacterCapability = { supported: false, runtime: client.mode, build: '', operations: [] };
         try { onOriginalFallback(error); } catch { /* notification cannot alter policy */ }
         const original = await persistAttempt(false, active);
         if (terminal || firstFrameSeen) throw stoppedError ?? error;

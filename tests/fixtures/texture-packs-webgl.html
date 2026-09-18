@@ -1,0 +1,30 @@
+<!doctype html><meta charset="utf-8"><title>Texture upload isolation check</title><body style="font:16px system-ui;background:#161817;color:#fff;padding:32px"><h1>Texture upload isolation check</h1><p id="result">Running…</p><script type="module">
+import {installTexturePacks} from '../../web/texture-packs.js';
+try {
+ const outputs=[];
+ for (const mode of ['mutable', 'immutable', 'partial']) for(const [account, replacement] of [['Original',null],['Account A',[9,8,7,6]],['Account B',[6,7,8,9]]]){
+  const label = `${account} / ${mode}`; const size = mode === 'partial' ? 2 : 1;
+  const canvas=document.createElement('canvas');const gl=canvas.getContext('webgl2');if(!gl)throw Error('WebGL2 unavailable');
+  const tex=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,tex);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
+  const heap=new Uint8Array(4+size*size*4);for(let i=4;i<heap.length;i+=4)heap.set([1,2,3,4],i);
+  const env={glTexImage2D:(target,level,internal,w,h,border,format,type,ptr)=>gl.texImage2D(target,level,internal,w,h,border,format,type,heap.subarray(ptr,ptr+w*h*4))};
+  env.glBindTexture=(target,id)=>gl.bindTexture(target,id === 1 ? tex : null);
+  env.glTexStorage2D=(target,levels,format,w,h)=>gl.texStorage2D(target,levels,format,w,h);
+  env.glTexSubImage2D=(target,level,x,y,w,h,format,type,ptr)=>gl.texSubImage2D(target,level,x,y,w,h,format,type,heap.subarray(ptr,ptr+w*h*4));
+  const manifest={format:1,packs:replacement?[{entries:[{target:size===2?0x6339254e:0x49c30432,width:size,height:size,rgbaBase64:btoa(String.fromCharCode(...Array.from({length:size*size},()=>replacement).flat()))}]}]:[]};
+  const seam=installTexturePacks({imports:{env},module:{HEAPU8:heap,ctx:gl},manifest});
+  env.glBindTexture(gl.TEXTURE_2D,1);
+  if(mode !== 'mutable') {
+   env.glTexStorage2D(gl.TEXTURE_2D,1,gl.RGBA8,size,size);
+   env.glTexSubImage2D(gl.TEXTURE_2D,0,0,0,size,size,gl.RGBA,gl.UNSIGNED_BYTE,4);
+  } else env.glTexImage2D(gl.TEXTURE_2D,0,gl.RGBA,1,1,0,gl.RGBA,gl.UNSIGNED_BYTE,4);
+  if(mode === 'partial') { heap.set([5,6,7,8],4); env.glTexSubImage2D(gl.TEXTURE_2D,0,0,0,1,1,gl.RGBA,gl.UNSIGNED_BYTE,4); }
+  const fb=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,fb);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,tex,0);
+  const out=new Uint8Array(4);gl.readPixels(0,0,1,1,gl.RGBA,gl.UNSIGNED_BYTE,out);
+  const expected=replacement||(mode==='partial'?[5,6,7,8]:[1,2,3,4]);if(out.some((v,i)=>v!==expected[i]))throw Error(`${label}: ${out} != ${expected}`);
+  if(heap.subarray(4).some((v,i)=>v!==(mode==='partial'&&i<4?[5,6,7,8]:[1,2,3,4])[i%4]))throw Error('Client heap changed');
+  const p=document.createElement('p');p.textContent=`${label}: PASS (${out})`;document.body.append(p);seam?.dispose();outputs.push(label);
+ }
+ document.getElementById('result').textContent=`PASS: ${outputs.length} independent WebGL2 uploads. Synthetic source data; not live game compatibility.`;
+}catch(error){document.getElementById('result').textContent=`FAIL: ${error.message}`;}
+</script>

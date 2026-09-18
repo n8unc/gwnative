@@ -94,4 +94,17 @@ describe('user guide', () => {
     assert.match(body, /Code 058/);
     assert.match(body, /current one in a fresh process/i);
   });
+
+  it('explains Phase 2 launch choices and texture limits without overclaiming formats', () => {
+    const body = text();
+    assert.match(body, /launch group/i);
+    assert.match(body, /next-launch/i);
+    assert.match(body, /preferred character/i);
+    assert.match(body, /exact recognised JSPI/i);
+    assert.match(body, /Asyncify.*character choice to you/i);
+    assert.match(body, /Last seen characters.*live character list/i);
+    assert.match(body, /first one wins/i);
+    assert.match(body, /legacy 32-bit TexMod TPF/i);
+    assert.match(body, /does not claim support for arbitrary uMod/i);
+  });
 });

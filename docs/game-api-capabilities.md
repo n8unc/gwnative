@@ -15,8 +15,10 @@ no optional state capability can be enabled.
   that has no active consumer.
 - Keep companion code passive: it may read certified memory and write only to
   host-allocated private blocks.
-- Keep product routes read-only. Scene control, login automation, and other
-  mutations belong to authenticated benchmark-only builds and routes.
+- Keep public product routes read-only. The launcher’s private login and
+  preferred-character startup bridges are narrow, separately proven exceptions;
+  they grant no external control route. Other scene mutations belong to
+  authenticated benchmark-only builds and routes.
 - Make each merge request small enough to review, test, and revert as one
   mechanism.
 
@@ -82,6 +84,15 @@ observed only while `asyncify_get_state()` reports Normal; Unwinding and
 Rewinding skip all companion work.
 
 ## Capability contract
+
+Preferred-character startup is outside the public game API. A session-private,
+exact-build JSPI transform provides bounded roster observations and closed
+selection/Play operations; Asyncify remains unsupported and manual. No roster,
+selection, Play, or entered-state operation is exposed through `/__game`.
+Character actions run only through the verified game callback, independently
+of the passive companion. The bridge is separate from reader/publisher tokens
+and grants no external game-control route. Current implementation and live
+acceptance limits are recorded in [Phase 2 character capability](launcher-phase-2-character.md).
 
 Each domain has its own descriptor rather than an offset inside one global
 snapshot:

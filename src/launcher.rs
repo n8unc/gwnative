@@ -28,10 +28,14 @@ use serde_json::{Value, json};
 
 use crate::launcher_accounts::{
     Account, AccountDraft, AccountPatch, AccountRepository, CredentialStore,
-    KeychainCredentialStore, PasswordChange, ProfileBusy, ProfileLease,
+    KeychainCredentialStore, LaunchGroupDraft, PasswordChange, ProfileBusy, ProfileLease,
+};
+use crate::launcher_preferences::{
+    self as launch_options, FrameRateLimit, InvocationOverrides, LaunchDefaults, LaunchFrame,
+    WindowMode,
 };
 use crate::launcher_sessions::{
-    CurrentExecutable, GameHost, HostCommand, IpcProbe, SessionController, SessionState,
+    CurrentExecutable, GameHost, HostCommand, IpcProbe, LaunchSpec, SessionController, SessionState,
 };
 use crate::{app, cli, dock, instance, paths, profile};
 
@@ -64,9 +68,14 @@ pub fn register_game(profile_id: &str) -> Result<Option<Account>, String> {
     let account = game_account(profile_id)?;
     MANAGED_GAME.store(account.is_some(), std::sync::atomic::Ordering::Release);
     MANAGED_AUTO_LOGIN.store(
-        account
-            .as_ref()
-            .is_some_and(|account| account.auto_login && account.has_password),
+        std::env::var("GWNATIVE_ACCOUNT_AUTO_LOGIN")
+            .ok()
+            .and_then(|s| s.parse::<bool>().ok())
+            .unwrap_or_else(|| {
+                account
+                    .as_ref()
+                    .is_some_and(|account| account.auto_login && account.has_password)
+            }),
         std::sync::atomic::Ordering::Release,
     );
     Ok(account)
@@ -113,6 +122,12 @@ struct State {
     _lock: instance::Instance,
     update: Arc<Mutex<(bool, String)>>,
     offline: bool,
+    invocation_overrides: InvocationOverrides,
+    textures: crate::launcher_textures::LibraryWorker,
+    auto_pending: Vec<String>,
+    auto_pending_since: Instant,
+    group_results: std::collections::HashMap<String, Vec<Value>>,
+    launch_notices: std::collections::HashMap<String, String>,
     quit_all: bool,
     closing_since: std::collections::HashMap<String, Instant>,
     deleting: HashSet<String>,
@@ -153,9 +168,25 @@ impl State {
                 );
             }
         }
+        if !self.auto_pending.is_empty() {
+            let pending = std::mem::take(&mut self.auto_pending);
+            let ready = self.textures.ready()
+                || self.auto_pending_since.elapsed() >= Duration::from_secs(5);
+            let (ids, waiting): (Vec<_>, Vec<_>) = pending.into_iter().partition(|id| {
+                ready
+                    || self
+                        .account(id)
+                        .map_or(true, |a| a.launch_preferences.texture_pack_ids.is_empty())
+            });
+            self.auto_pending = waiting;
+            let _ = self.launch_accounts(&ids);
+        }
         self.sessions.tick();
+        self.update_group_results();
+        self.textures.release_finished(&self.sessions.snapshots());
     }
     fn snapshot(&mut self) -> Result<Value, String> {
+        self.update_group_results();
         let snapshots = self.sessions.snapshots();
         let busy = self.busy();
         let accounts = self
@@ -197,12 +228,32 @@ impl State {
                         .get(&a.profile_id)
                         .is_some_and(|t| t.elapsed() > Duration::from_secs(5));
                 let mut value = serde_json::to_value(&a).expect("Account metadata serializes");
+                value["windowPreferences"] = json!(crate::window::state::preferences(
+                    &support(&self.base, &a.profile_id).join("window.json")
+                ));
+                value["lastSeenCharacters"] = json!(crate::character_bridge::load_observations(
+                    &support(&self.base, &a.profile_id)
+                ));
                 value["status"] = json!(status);
                 value["statusLabel"] = json!(label);
+                value["launchWarning"] = json!(self.launch_notices.get(&a.profile_id));
                 value["busy"] = json!(held);
                 value["canShow"] = json!(show);
                 value["canClose"] = json!(close);
                 value["canForceQuit"] = json!(force);
+                value
+            })
+            .collect::<Vec<_>>();
+        let groups = self
+            .repository
+            .groups()?
+            .into_iter()
+            .map(|group| {
+                let mut value = json!(group);
+                if let Some(members) = self.group_results.get(&group.id) {
+                    let results = members;
+                    value["lastLaunch"] = json!(results);
+                }
                 value
             })
             .collect::<Vec<_>>();
@@ -211,8 +262,95 @@ impl State {
             .lock()
             .map_err(|_| "Update status unavailable")?;
         Ok(
-            json!({ "accounts": accounts, "retained": self.repository.retained()?, "updating": update.0, "updateMessage": update.1 }),
+            json!({ "accounts": accounts, "groups": groups, "textureLibrary": self.textures.snapshot(), "retained": self.repository.retained()?, "updating": update.0, "updateMessage": update.1 }),
         )
+    }
+    fn update_group_results(&mut self) {
+        let snapshots = self.sessions.snapshots();
+        for members in self.group_results.values_mut() {
+            for member in members.iter_mut().filter(|member| member["queued"] == true) {
+                let current = snapshots
+                    .iter()
+                    .find(|s| Some(s.profile_id.as_str()) == member["profileId"].as_str());
+                let (status, final_result) = match current.map(|s| &s.state) {
+                    Some(SessionState::Queued) => ("Queued".to_owned(), false),
+                    Some(SessionState::AwaitingWindow) => ("Starting".into(), false),
+                    Some(SessionState::Running { .. } | SessionState::Closing { .. }) => {
+                        ("Started".into(), true)
+                    }
+                    Some(SessionState::Failed { reason }) => (format!("Failed: {reason}"), true),
+                    None => ("Cancelled before start".into(), true),
+                };
+                member["status"] = json!(status);
+                if final_result {
+                    member["queued"] = json!(false);
+                }
+            }
+        }
+    }
+    fn launch_accounts(&mut self, ids: &[String]) -> Result<Value, String> {
+        if self.quit_all {
+            return Err("Games are closing. Finish Quit all first.".into());
+        }
+        self.update_group_results();
+        let mut members = Vec::new();
+        for id in ids {
+            let account = match self.account(id) {
+                Ok(account) => account,
+                Err(error) => {
+                    members.push(json!({"id":id,"name":"Missing Account","status":error}));
+                    continue;
+                }
+            };
+            if self.busy().is_busy(&account.profile_id) {
+                members.push(json!({"id":id,"name":account.nickname,"status":"Skipped: already queued or running"}));
+                continue;
+            }
+            let mut spec = match launch_spec(&self.base, &account, &self.invocation_overrides) {
+                Ok(spec) => spec,
+                Err(error) => {
+                    members.push(json!({"id":id,"name":account.nickname,"status":format!("Failed: {error}")}));
+                    continue;
+                }
+            };
+            spec.env.insert(
+                "GWNATIVE_ACCOUNT_AUTO_LOGIN".into(),
+                (account.auto_login && account.has_password).to_string(),
+            );
+            let mut texture_warnings = self.textures.warnings(&spec.options.texture_pack_ids);
+            let texture_warning = match self
+                .textures
+                .pin(&account.profile_id, &spec.options.texture_pack_ids)
+            {
+                Ok(Some(path)) => {
+                    spec.env.insert(
+                        "GWNATIVE_TEXTURE_MANIFEST".into(),
+                        path.to_string_lossy().into_owned(),
+                    );
+                    None
+                }
+                Ok(None) => None,
+                Err(error) => Some(error),
+            };
+            if let Some(warning) = &texture_warning {
+                texture_warnings.push(warning.clone());
+            }
+            if texture_warnings.is_empty() {
+                self.launch_notices.remove(&account.profile_id);
+            } else {
+                self.launch_notices
+                    .insert(account.profile_id.clone(), texture_warnings.join(" · "));
+            }
+            // An inherited session manifest must never reach another Account.
+            spec.env
+                .entry("GWNATIVE_TEXTURE_MANIFEST".into())
+                .or_default();
+            let queued = self
+                .sessions
+                .request_spec(spec, support(&self.base, &account.profile_id));
+            members.push(json!({"id":id,"name":account.nickname,"profileId":account.profile_id,"queued":queued,"status":if queued { texture_warning.map(|e| format!("Queued · texture packs bypassed: {e}")).unwrap_or_else(|| "Queued".into()) } else {"Skipped".into()}}));
+        }
+        Ok(json!({"members":members}))
     }
     fn start_updates(&self, manual: bool) -> Result<(), String> {
         if self.offline {
@@ -308,6 +446,31 @@ impl State {
             "checkUpdates" => self.start_updates(true)?,
             "save" => {
                 let busy = self.busy();
+                let preferences = value
+                    .get("launchPreferences")
+                    .map(|p| {
+                        serde_json::from_value::<launch_options::AccountLaunchPreferences>(
+                            p.clone(),
+                        )
+                        .map_err(|e| e.to_string())
+                    })
+                    .transpose()?;
+                if let Some(preferences) = &preferences {
+                    launch_options::validate_account_launch_preferences(preferences)?;
+                }
+                let fixed = value
+                    .get("fixedLaunchFrame")
+                    .map(|frame| {
+                        serde_json::from_value::<Option<crate::window::state::Bounds>>(
+                            frame.clone(),
+                        )
+                        .map_err(|e| e.to_string())
+                    })
+                    .transpose()?;
+                if let Some(Some(frame)) = fixed {
+                    crate::window::state::validate_frame(frame)?;
+                }
+                let saved_account;
                 if let Some(id) = value["accountId"].as_str() {
                     let current = self.account(id)?;
                     let email = text(value, "email")?;
@@ -321,7 +484,7 @@ impl State {
                     } else {
                         PasswordChange::Keep
                     };
-                    self.repository.save_form(
+                    saved_account = self.repository.save_form(
                         id,
                         AccountPatch {
                             nickname: Some(text(value, "nickname")?.into()),
@@ -329,6 +492,7 @@ impl State {
                             auto_login: Some(!changed_email && flag(value, "autoLogin")),
                             auto_launch: Some(flag(value, "autoLaunch")),
                             preserve_context: flag(value, "preserveContext"),
+                            launch_preferences: preferences.clone(),
                         },
                         password,
                         &busy,
@@ -354,7 +518,7 @@ impl State {
                             .filter(|c| c.username().eq_ignore_ascii_case(&email))
                             .map(|c| c.password().to_owned())
                     });
-                    self.repository.create_with_profile(
+                    saved_account = self.repository.create_with_profile(
                         AccountDraft {
                             profile_id,
                             nickname: text(value, "nickname")?.into(),
@@ -366,7 +530,66 @@ impl State {
                         &busy,
                         |profile_id| profile::select(&self.base, Some(profile_id)).map(|_| ()),
                     )?;
+                    if let Some(preferences) = preferences {
+                        self.repository.update(
+                            &saved_account.id,
+                            AccountPatch {
+                                launch_preferences: Some(preferences),
+                                ..Default::default()
+                            },
+                            &busy,
+                        )?;
+                    }
                 }
+                save_fixed_launch_frame(
+                    &support(&self.base, &saved_account.profile_id).join("window.json"),
+                    fixed,
+                )?;
+            }
+            "textureConflicts" => {
+                let ids = serde_json::from_value::<Vec<String>>(value["packIds"].clone())
+                    .map_err(|_| "Invalid pack selection")?;
+                if ids.len() > 64 {
+                    return Err("Too many texture packs selected".into());
+                }
+                return Ok(json!(self.textures.conflicts(&ids)));
+            }
+            "refreshTextures" => self.textures.refresh()?,
+            "openTextureFolder" => {
+                let folder = self.textures.folder()?;
+                std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
+                std::process::Command::new("/usr/bin/open")
+                    .arg(folder)
+                    .spawn()
+                    .map_err(|e| e.to_string())?;
+            }
+            "saveGroup" => {
+                let draft = LaunchGroupDraft {
+                    name: text(value, "name")?.into(),
+                    account_ids: serde_json::from_value(value["accountIds"].clone())
+                        .map_err(|e| e.to_string())?,
+                };
+                if let Some(id) = value["groupId"].as_str() {
+                    self.repository.update_group(id, draft)?;
+                } else {
+                    self.repository.create_group(draft)?;
+                }
+            }
+            "deleteGroup" => {
+                self.repository.delete_group(text(value, "groupId")?)?;
+            }
+            "launchGroup" => {
+                let group = self
+                    .repository
+                    .groups()?
+                    .into_iter()
+                    .find(|g| Some(g.id.as_str()) == value["groupId"].as_str())
+                    .ok_or("Group no longer exists")?;
+                let result = self.launch_accounts(&group.account_ids)?;
+                if let Some(members) = result["members"].as_array() {
+                    self.group_results.insert(group.id, members.clone());
+                }
+                return Ok(result);
             }
             "toggle" => {
                 let id = text(value, "accountId")?;
@@ -380,27 +603,11 @@ impl State {
                 self.repository.update(id, patch, &self.busy())?;
             }
             "play" => {
-                let ids = value["accountIds"]
-                    .as_array()
-                    .ok_or("Select Accounts to launch")?;
-                if self.quit_all {
-                    return Err("Games are closing. Finish or cancel Quit all first.".into());
-                }
-                let accounts = ids
-                    .iter()
-                    .map(|id| self.account(id.as_str().ok_or("Invalid Account")?))
-                    .collect::<Result<Vec<_>, String>>()?;
-                let accounts = accounts
-                    .into_iter()
-                    .filter(|account| !self.busy().is_busy(&account.profile_id))
-                    .collect::<Vec<_>>();
-                for account in accounts {
-                    self.sessions.request(
-                        &account.profile_id,
-                        support(&self.base, &account.profile_id),
-                    );
-                }
+                let ids = serde_json::from_value::<Vec<String>>(value["accountIds"].clone())
+                    .map_err(|_| "Select Accounts to launch")?;
+                return self.launch_accounts(&ids);
             }
+
             "show" | "close" | "cancel" | "forceQuit" => {
                 let account = self.account(text(value, "accountId")?)?;
                 match action {
@@ -440,6 +647,76 @@ impl State {
         }
         Ok(json!({"ok":true}))
     }
+}
+
+fn invocation_overrides(invocation: &cli::Invocation) -> InvocationOverrides {
+    InvocationOverrides {
+        muted: invocation.legacy.mute.then_some(true),
+        frame_rate_limit: invocation.legacy.fps.map(FrameRateLimit::Limit),
+        window_mode: invocation.legacy.window_mode.map(|mode| match mode {
+            cli::WindowMode::Windowed => WindowMode::Windowed,
+            cli::WindowMode::Fullscreen => WindowMode::Fullscreen,
+        }),
+        preferred_character: invocation.legacy.character.clone().map(Some),
+        ..Default::default()
+    }
+}
+
+/// `None` means an older caller omitted this preference. `Some(None)` is the
+/// explicit Restore-last-layout choice and must clear an existing fixed frame.
+fn save_fixed_launch_frame(
+    path: &Path,
+    frame: Option<Option<crate::window::state::Bounds>>,
+) -> Result<(), String> {
+    if let Some(frame) = frame {
+        crate::window::state::set_fixed_frame(path, frame)?;
+    }
+    Ok(())
+}
+
+fn launch_spec(
+    base: &Path,
+    account: &Account,
+    overrides: &InvocationOverrides,
+) -> Result<LaunchSpec, String> {
+    let stored = crate::window::state::launch_snapshot(
+        &support(base, &account.profile_id).join("window.json"),
+    );
+    let defaults = LaunchDefaults {
+        window_frame: stored.map(|s| LaunchFrame {
+            x: s.bounds.x,
+            y: s.bounds.y,
+            width: s.bounds.width,
+            height: s.bounds.height,
+        }),
+        window_mode: if stored.is_some_and(|s| s.mode == crate::window::state::Mode::Fullscreen) {
+            WindowMode::Fullscreen
+        } else {
+            WindowMode::Windowed
+        },
+        ..Default::default()
+    };
+    let mut spec = LaunchSpec::game(
+        &std::env::current_exe().map_err(|e| e.to_string())?,
+        &account.profile_id,
+    );
+    spec.options =
+        launch_options::resolve_launch_options(&defaults, &account.launch_preferences, overrides);
+    if overrides.window_mode.is_none()
+        && account.launch_preferences.window_mode.is_none()
+        && stored.is_some_and(|s| s.mode == crate::window::state::Mode::Maximized)
+    {
+        spec.env
+            .insert("GWNATIVE_RESTORE_MAXIMIZED".into(), "1".into());
+    } else {
+        spec.env
+            .insert("GWNATIVE_RESTORE_MAXIMIZED".into(), "0".into());
+    }
+    spec.env.insert(
+        "GWNATIVE_ACCOUNT_AUTO_LOGIN".into(),
+        (account.auto_login && account.has_password).to_string(),
+    );
+    Ok(spec)
 }
 
 fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -484,6 +761,16 @@ define_class!(
                 return;
             };
             let id = request["id"].as_u64().unwrap_or(0);
+            if request["action"] == "changeTextureFolder" {
+                choose_texture_folder(id);
+                wipe_value(&mut request);
+                return;
+            }
+            if request["action"] == "captureLayout" {
+                begin_capture(&request, id);
+                wipe_value(&mut request);
+                return;
+            }
             if request["action"] == "remove" && flag(&request, "deleteFiles") {
                 begin_removal(&request, id);
                 wipe_value(&mut request);
@@ -638,25 +925,25 @@ pub fn run(invocation: &cli::Invocation) -> Result<(), String> {
     for account in &accounts {
         let _ = sessions.reconnect(&account.profile_id, support(&base, &account.profile_id));
     }
-    for account in &accounts {
-        if account.auto_launch
-            && !(Busy {
-                base: base.clone(),
-                queued: HashSet::new(),
-            })
-            .is_busy(&account.profile_id)
-        {
-            sessions.request(&account.profile_id, support(&base, &account.profile_id));
-        }
-    }
     let settings = Arc::new(crate::settings::Store::open(base.join("settings.json")));
     let updates = Arc::new(crate::settings::UpdateStore::open(
         base.join("updates.json"),
         &settings.get(),
     ));
     let settings = Arc::new(crate::settings::ScopedStore::new(settings, updates));
+    let textures = crate::launcher_textures::LibraryWorker::start(&base);
+    let auto_pending = accounts
+        .iter()
+        .filter(|account| account.auto_launch)
+        .map(|a| a.id.clone())
+        .collect();
     let state = State {
         base,
+        textures,
+        auto_pending,
+        auto_pending_since: Instant::now(),
+        group_results: Default::default(),
+        launch_notices: Default::default(),
         repository,
         sessions,
         window: window.clone(),
@@ -667,6 +954,7 @@ pub fn run(invocation: &cli::Invocation) -> Result<(), String> {
             "Game content shared across accounts".into(),
         ))),
         offline: !invocation.automatic_updates_allowed(),
+        invocation_overrides: invocation_overrides(invocation),
         quit_all: false,
         closing_since: Default::default(),
         deleting: HashSet::new(),
@@ -768,6 +1056,12 @@ pub fn start_game_control(host: GameHost) -> Result<Arc<Mutex<GameHost>>, String
                 .unwrap_or_default();
             for command in commands {
                 match command {
+                    HostCommand::CaptureWindowLayout { request_id } => unsafe {
+                        app::to_main(
+                            Box::into_raw(Box::new(request_id)).cast(),
+                            capture_game_layout,
+                        )
+                    },
                     HostCommand::Close => app::request_quit(),
                     HostCommand::Show => unsafe { app::to_main(std::ptr::null_mut(), show_game) },
                 }
@@ -776,6 +1070,10 @@ pub fn start_game_control(host: GameHost) -> Result<Arc<Mutex<GameHost>>, String
         }
     });
     Ok(host)
+}
+extern "C" fn capture_game_layout(data: *mut std::ffi::c_void) {
+    let request_id = unsafe { Box::from_raw(data.cast::<String>()) };
+    crate::window::capture_current_layout(&request_id);
 }
 extern "C" fn show_game(_: *mut std::ffi::c_void) {
     let mtm = unsafe { MainThreadMarker::new_unchecked() };
@@ -814,6 +1112,89 @@ fn reply(id: u64, result: Result<(), String>) {
                     .webview
                     .evaluateJavaScript_completionHandler(&script, None);
             }
+        }
+    });
+}
+
+fn choose_texture_folder(reply_id: u64) {
+    // Run native modal outside STATE's RefCell borrow: AppKit pumps launcher
+    // timers while the picker is open, and those timers also reconcile STATE.
+    let panel =
+        objc2_app_kit::NSOpenPanel::openPanel(MainThreadMarker::new().expect("main thread"));
+    panel.setCanChooseDirectories(true);
+    panel.setCanChooseFiles(false);
+    panel.setAllowsMultipleSelection(false);
+    let result = if panel.runModal() == objc2_app_kit::NSModalResponseOK {
+        match panel
+            .URL()
+            .and_then(|u| u.path())
+            .map(|s| PathBuf::from(s.to_string()))
+        {
+            Some(path) => STATE.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .ok_or_else(|| "Launcher is closing".to_owned())?
+                    .textures
+                    .change_folder(path)
+            }),
+            None => Err("No texture folder selected".into()),
+        }
+    } else {
+        Ok(())
+    };
+    reply(reply_id, result);
+}
+
+fn begin_capture(request: &Value, reply_id: u64) {
+    let result = STATE.with(|slot| -> Result<_, String> {
+        let slot = slot.borrow();
+        let state = slot.as_ref().ok_or("Launcher is closing")?;
+        let account = state.account(text(request, "accountId")?)?;
+        let request_id = format!(
+            "{:032x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_nanos()
+        );
+        if !state
+            .sessions
+            .capture_window_layout(&account.profile_id, &request_id)?
+        {
+            return Err("Game window is not available".into());
+        }
+        Ok((
+            support(&state.base, &account.profile_id).join("window-capture.json"),
+            request_id,
+        ))
+    });
+    match result {
+        Ok((path, request_id)) => poll_capture(path, request_id, reply_id, Instant::now()),
+        Err(error) => reply(reply_id, Err(error)),
+    }
+}
+
+fn poll_capture(path: PathBuf, request_id: String, reply_id: u64, start: Instant) {
+    app::after(40, move || {
+        let value = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+        if let Some(value) = value.filter(|v| v["requestId"] == request_id) {
+            STATE.with(|slot| {
+                if let Some(state) = slot.borrow().as_ref() {
+                    let payload = json!({"id":reply_id,"result":{"frame":value["frame"]}});
+                    unsafe {
+                        state.webview.evaluateJavaScript_completionHandler(
+                            &NSString::from_str(&format!("window.launcherReply({payload})")),
+                            None,
+                        );
+                    }
+                }
+            });
+        } else if start.elapsed() < Duration::from_secs(3) {
+            poll_capture(path.clone(), request_id.clone(), reply_id, start);
+        } else {
+            reply(reply_id, Err("Game did not return its current window layout. Try again when its window is ready.".into()));
         }
     });
 }
@@ -885,4 +1266,84 @@ fn begin_removal(request: &Value, id: u64) {
             reply(id, result);
         },
     );
+}
+
+#[cfg(test)]
+mod phase_two_tests {
+    use super::*;
+
+    #[test]
+    fn launch_descriptor_freezes_layout_and_explicit_mode_wins() {
+        let scratch = crate::scratch::TempDir::new("launcher-descriptor");
+        let account = Account {
+            format_version: 1,
+            id: "account-test".into(),
+            profile_id: "profile-test".into(),
+            nickname: "Test".into(),
+            email: "test@example.invalid".into(),
+            auto_login: false,
+            auto_launch: false,
+            has_password: false,
+            launch_preferences: Default::default(),
+        };
+        let path = support(&scratch.0, &account.profile_id).join("window.json");
+        let observed = crate::window::state::State {
+            bounds: crate::window::state::Bounds {
+                x: 12.0,
+                y: 34.0,
+                width: 1000.0,
+                height: 700.0,
+            },
+            mode: crate::window::state::Mode::Maximized,
+        };
+        crate::window::state::save(&path, observed);
+        let fixed = crate::window::state::Bounds {
+            x: 50.0,
+            y: 70.0,
+            width: 1200.0,
+            height: 800.0,
+        };
+        crate::window::state::set_fixed_frame(&path, Some(fixed)).unwrap();
+        let spec = launch_spec(&scratch.0, &account, &InvocationOverrides::default()).unwrap();
+        assert_eq!(spec.options.window_frame.unwrap().x, 50.0);
+        assert_eq!(spec.env["GWNATIVE_RESTORE_MAXIMIZED"], "1");
+        crate::window::state::set_fixed_frame(&path, None).unwrap();
+        assert_eq!(
+            spec.options.window_frame.unwrap().x,
+            50.0,
+            "queued descriptor must not follow edits"
+        );
+        let explicit = launch_spec(
+            &scratch.0,
+            &account,
+            &InvocationOverrides {
+                window_mode: Some(WindowMode::Fullscreen),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(explicit.options.window_mode, WindowMode::Fullscreen);
+        assert_eq!(explicit.env["GWNATIVE_RESTORE_MAXIMIZED"], "0");
+        assert_eq!(explicit.options.window_frame.unwrap().x, 12.0);
+    }
+
+    #[test]
+    fn restore_layout_clears_an_existing_fixed_launch_frame() {
+        let scratch = crate::scratch::TempDir::new("launcher-clear-fixed-frame");
+        let path = scratch.0.join("window.json");
+        let fixed = crate::window::state::Bounds {
+            x: 50.0,
+            y: 70.0,
+            width: 1200.0,
+            height: 800.0,
+        };
+        crate::window::state::set_fixed_frame(&path, Some(fixed)).unwrap();
+
+        save_fixed_launch_frame(&path, Some(None)).unwrap();
+
+        assert_eq!(
+            crate::window::state::preferences(&path).fixed_launch_frame,
+            None
+        );
+    }
 }

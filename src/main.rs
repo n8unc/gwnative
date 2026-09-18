@@ -15,6 +15,7 @@ mod activation_cover;
 mod alert;
 mod app;
 mod cache;
+mod character_bridge;
 mod chunks;
 mod cli;
 mod commands;
@@ -31,8 +32,10 @@ mod instance;
 mod keychain;
 mod launcher;
 mod launcher_accounts;
+mod launcher_preferences;
 mod launcher_removal;
 mod launcher_sessions;
+mod launcher_textures;
 mod layout;
 mod manifest;
 mod menu;
@@ -53,6 +56,7 @@ mod server;
 mod settings;
 mod shell;
 mod sockets;
+mod texture_packs;
 mod transport;
 mod updater;
 mod wasm;
@@ -453,6 +457,7 @@ fn main() {
     let launch = server::LaunchContract::new(launch_nonce.clone(), transforms);
     let loopback = match server::spawn(server::Config {
         root: root.clone(),
+        profile_support_dir: paths.support_dir().to_owned(),
         shell_root,
         snapshot,
         recorder,

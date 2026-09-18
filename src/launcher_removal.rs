@@ -138,6 +138,7 @@ pub fn remove_account<S, W, F>(
                     },
                     Ok(false) => (
                         crate::launcher_accounts::Account {
+                            launch_preferences: Default::default(),
                             format_version: 1,
                             id: retained.id,
                             profile_id: retained.profile_id,

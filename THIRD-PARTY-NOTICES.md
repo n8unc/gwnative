@@ -13,8 +13,9 @@ GPL-3.0-only. The complete machine-readable path annotations are in
 - Licence: GPL-3.0-only
 - Reviewed baselines:
   [`459c269e`](https://github.com/Mat4m0/gwonmac/commit/459c269e41f52b9aa995c56999f0a61a33e5def6),
-  [`34cff799`](https://github.com/Mat4m0/gwonmac/commit/34cff799a02b8f2717eca73531cb5eb3bc737985), and
-  [`5219446`](https://github.com/Mat4m0/gwonmac/commit/5219446f4f475551606ebacdae8da54df16507d7)
+  [`34cff799`](https://github.com/Mat4m0/gwonmac/commit/34cff799a02b8f2717eca73531cb5eb3bc737985),
+  [`5219446`](https://github.com/Mat4m0/gwonmac/commit/5219446f4f475551606ebacdae8da54df16507d7), and
+  [`004194ff`](https://github.com/Mat4m0/gwonmac/commit/004194ff318320f854240fd227462b19889bef24)
 
 gwnative modifies and reorganises GWoNmac-derived companion, input,
 enhancement, filesystem, platform, template, and WebAssembly transformation
@@ -22,6 +23,9 @@ code. The affected current paths are:
 
 - `src/companion-kernel/lib.rs`
 - `src/wasm/rewrite.rs`
+- `src/wasm/character*.rs`
+- `src/texture_packs.rs`
+- `web/texture-packs.js`
 - `web/companion-snapshot.js`
 - `web/enhancement-cursor.js`
 - `web/enhancement-readout.js`

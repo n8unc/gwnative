@@ -343,6 +343,24 @@ describe('runtime lifecycle', () => {
     return { lifecycle, target, calls };
   };
 
+  it('tracks character-only transforms even when template saving is unavailable', async () => {
+    const { lifecycle, target, calls } = lifecycleFixture({ target: {
+      __gwnativeTemplateSave: 'uncertified', __gwnativePreparedTransform: true,
+      __gwnativeCharacterCapability: { supported: true },
+    } });
+    await lifecycle.start();
+    assert.equal(calls[0][1].transformed, true);
+    let attempts = 0;
+    await lifecycle.instantiate(async () => {
+      if (++attempts === 1) throw new Error('character transform failed');
+      return 'official';
+    });
+    assert.equal(calls[1][0], '__transform-failed');
+    assert.equal(calls[2][1].transformed, false);
+    assert.equal(target.__gwnativePreparedTransform, false);
+    assert.equal(target.__gwnativeCharacterCapability.supported, false);
+  });
+
   it('records exact attempt before invoking glue and coalesces starts', async () => {
     const { lifecycle, target, calls } = lifecycleFixture();
     const events = [];
@@ -609,5 +627,20 @@ describe('runtime lifecycle', () => {
     assert.equal(original.transformed, false);
     assert.equal(target.__gwnativeTemplateSave, 'failed');
     assert.equal(target.__gwnativeEnhancements, 'off');
+  });
+});
+
+it('character actions use only selected runtime exact native capability', () => {
+  const target = { __gwnativeRuntimeCapabilities: {
+    jspi: { build: 'reviewed-jspi', characterStartup: true },
+    asyncify: { build: 'other', characterStartup: false },
+  } };
+  applyClientLimits({ mode: 'jspi' }, {}, target);
+  assert.equal(target.__gwnativeCharacterCapability.supported, true);
+  assert.equal(target.__gwnativeCharacterCapability.runtime, 'jspi');
+  assert.equal(target.__gwnativeCharacterCapability.operations.length, 6);
+  applyClientLimits({ mode: 'asyncify' }, {}, target);
+  assert.deepEqual(target.__gwnativeCharacterCapability, {
+    supported: false, runtime: 'asyncify', build: 'other', operations: [],
   });
 });

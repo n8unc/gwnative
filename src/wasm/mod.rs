@@ -18,6 +18,11 @@
 //! Wasm/glue pairs and cannot enable the target readout; see `cursor`.
 
 mod certificate;
+mod character;
+mod character_action_proof;
+mod character_actions;
+mod character_selector;
+mod character_world;
 mod codec;
 mod cursor;
 mod launcher_prefill;
@@ -107,7 +112,7 @@ struct RuntimeModule {
     template_save: &'static str,
     enhancements: &'static str,
     enhancement_manifest: Option<serde_json::Value>,
-    #[serde(skip)]
+    character_startup: bool,
     prepared_transform: bool,
 }
 
@@ -118,6 +123,7 @@ impl RuntimeModule {
             template_save: state,
             enhancements: if enhance { state } else { enhancements::OFF },
             enhancement_manifest: None,
+            character_startup: false,
             prepared_transform: false,
         }
     }
@@ -354,6 +360,19 @@ fn prepare_runtime_inner(
     {
         let output = launcher_prefill::rewrite(runtime, &input, &glue)?
             .ok_or("launcher-prefill: reviewed pair vanished during rewrite")?;
+        // Character observation has its own exact input and body proofs. A
+        // future unknown client retains the independently reviewed prefill.
+        let (output, character_startup) = if runtime == Runtime::Jspi {
+            match character::rewrite_jspi(&output) {
+                Ok(derived) => (derived, true),
+                Err(reason) => {
+                    note!("[character] startup unavailable: {reason}");
+                    (output, false)
+                }
+            }
+        } else {
+            (output, false)
+        };
         let output_hash = digest(&output);
         let compatibility_id = runtime_compatibility_id(
             runtime,
@@ -369,10 +388,17 @@ fn prepare_runtime_inner(
             ));
         }
         let dir = cache_root
-            .join("launcher-prefill")
+            .join(if character_startup {
+                "character-startup"
+            } else {
+                "launcher-prefill"
+            })
             .join(runtime.key())
             .join(&wasm_hash)
             .join(launcher_prefill::ABI.to_string());
+        // Output identity is part of compatibility. Keep concurrent hosts on
+        // distinct immutable derived artifacts across transformer updates.
+        let dir = dir.join(&output_hash);
         let path = dir.join(runtime.wasm_name());
         if !fs::read(&path).is_ok_and(|bytes| digest(&bytes) == output_hash) {
             fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -385,6 +411,7 @@ fn prepare_runtime_inner(
                 template_save: enhancements::UNCERTIFIED,
                 enhancements: enhancements::OFF,
                 enhancement_manifest: None,
+                character_startup,
                 prepared_transform: true,
             },
         ));
@@ -436,7 +463,8 @@ fn prepare_runtime_inner(
                     .join("launcher-prefill")
                     .join(runtime.key())
                     .join(&wasm_hash)
-                    .join(launcher_prefill::ABI.to_string());
+                    .join(launcher_prefill::ABI.to_string())
+                    .join(&output_hash);
                 let path = dir.join(runtime.wasm_name());
                 if !fs::read(&path).is_ok_and(|bytes| digest(&bytes) == output_hash) {
                     fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -492,6 +520,7 @@ fn prepare_runtime_inner(
             template_save: "ready",
             enhancements: enhancement_state,
             enhancement_manifest: manifest,
+            character_startup: false,
             prepared_transform: true,
         },
     ))
@@ -605,6 +634,32 @@ mod tests {
         assert_eq!(json["ensureDirectory"], -70_001);
         assert_eq!(json["fileExists"], -70_005);
         assert_eq!(json.as_object().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn runtime_facts_publish_character_startup_only_after_complete_rewrite() {
+        let mut runtimes = BTreeMap::new();
+        runtimes.insert(
+            Runtime::Asyncify.key(),
+            RuntimeModule::unavailable(None, enhancements::UNCERTIFIED, true),
+        );
+        runtimes.insert(
+            Runtime::Jspi.key(),
+            RuntimeModule {
+                build: Some("exact-rewritten-output".into()),
+                template_save: enhancements::UNCERTIFIED,
+                enhancements: enhancements::OFF,
+                enhancement_manifest: None,
+                character_startup: true,
+                prepared_transform: true,
+            },
+        );
+        let facts: serde_json::Value =
+            serde_json::from_str(&Module { runtimes }.runtimes_json()).unwrap();
+        assert_eq!(facts[Runtime::Asyncify.key()]["characterStartup"], false);
+        assert_eq!(facts[Runtime::Jspi.key()]["characterStartup"], true);
+        assert_eq!(facts[Runtime::Asyncify.key()]["preparedTransform"], false);
+        assert_eq!(facts[Runtime::Jspi.key()]["preparedTransform"], true);
     }
 
     #[test]

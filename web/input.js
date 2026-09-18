@@ -102,6 +102,29 @@ export function installGameInput({ canvas, touchMode = 'off', log }) {
   let wheelRemainder = 0;
   let wheelDirection = 0;
   let wheelAt = 0;
+  // A reset tells the client every tracked button came up. macOS can still
+  // deliver movement and the eventual physical ups from that old gesture; do
+  // not let those stale events recreate a client drag without its down.
+  let staleButtons = 0;
+  let staleMoveNoted = false;
+  /** @type {Array<Record<string, string | number | boolean>>} */
+  const mouseDiagnostics = [];
+
+  /** @param {number} button */
+  const buttonMask = (button) => {
+    if (button === 0) return 1;
+    if (button === 1) return 4;
+    if (button === 2) return 2;
+    if (button === 3) return 8;
+    if (button === 4) return 16;
+    return 0;
+  };
+
+  /** @param {string} transition @param {Record<string, string | number | boolean>} [detail] */
+  const noteMouse = (transition, detail = {}) => {
+    mouseDiagnostics.push({ transition, ...detail });
+    if (mouseDiagnostics.length > 32) mouseDiagnostics.shift();
+  };
 
   const resetWheel = () => {
     wheelRemainder = 0;
@@ -111,13 +134,7 @@ export function installGameInput({ canvas, touchMode = 'off', log }) {
 
   const currentButtons = () => {
     let buttons = 0;
-    for (const button of heldButtons.keys()) {
-      if (button === 0) buttons |= 1;
-      else if (button === 1) buttons |= 4;
-      else if (button === 2) buttons |= 2;
-      else if (button === 3) buttons |= 8;
-      else if (button === 4) buttons |= 16;
-    }
+    for (const button of heldButtons.keys()) buttons |= buttonMask(button);
     return buttons;
   };
 
@@ -328,16 +345,24 @@ export function installGameInput({ canvas, touchMode = 'off', log }) {
     }
   }
 
-  function releaseButtons() {
+  /** @param {string} [reason] */
+  function releaseButtons(reason = 'explicit-reset') {
     const inputs = [...heldButtons.values()];
+    const released = currentButtons();
+    staleButtons |= released;
+    staleMoveNoted = false;
     heldButtons.clear();
+    noteMouse('reset', { reason, buttons: released, staleButtons });
     releasePointer();
+    let remaining = released;
     for (const input of inputs) {
+      remaining &= ~buttonMask(input.button);
+      noteMouse('up', { button: input.button, buttons: remaining, synthetic: true });
       input.target?.dispatchEvent(new MouseEvent('mouseup', {
         bubbles: true,
         cancelable: true,
         button: input.button,
-        buttons: 0,
+        buttons: remaining,
         clientX: input.clientX,
         clientY: input.clientY,
         screenX: input.screenX,
@@ -350,7 +375,8 @@ export function installGameInput({ canvas, touchMode = 'off', log }) {
     }
   }
 
-  function releaseAll() {
+  /** @param {string} [reason] */
+  function releaseAll(reason = 'explicit-reset') {
     if (releasing) return;
     releasing = true;
     try {
@@ -358,7 +384,7 @@ export function installGameInput({ canvas, touchMode = 'off', log }) {
       cancelSyntheticTouches();
       resetWheel();
       releaseKeys();
-      releaseButtons();
+      releaseButtons(reason);
     } finally {
       releasing = false;
     }
@@ -403,6 +429,8 @@ export function installGameInput({ canvas, touchMode = 'off', log }) {
 
   window.addEventListener('mousedown', (event) => {
     if (!event.isTrusted) return;
+    const mask = buttonMask(event.button);
+    if (mask && (staleButtons & mask)) staleButtons &= ~mask;
     heldButtons.set(event.button, {
       target: event.target,
       button: event.button,
@@ -415,12 +443,37 @@ export function installGameInput({ canvas, touchMode = 'off', log }) {
       altKey: event.altKey,
       metaKey: event.metaKey,
     });
+    noteMouse('down', { button: event.button, buttons: event.buttons });
   }, true);
   window.addEventListener('mouseup', (event) => {
-    if (event.isTrusted) heldButtons.delete(event.button);
+    if (!event.isTrusted) return;
+    heldButtons.delete(event.button);
+    const mask = buttonMask(event.button);
+    if (mask && (staleButtons & mask)) {
+      staleButtons &= ~mask;
+      noteMouse('stale-up', { button: event.button, staleButtons });
+      event.stopImmediatePropagation();
+      return;
+    }
+    noteMouse('up', { button: event.button, buttons: event.buttons });
   }, true);
   window.addEventListener('mousemove', (event) => {
-    if (!event.isTrusted || heldButtons.size === 0) return;
+    if (!event.isTrusted) return;
+    if (event.buttons === 0 && staleButtons) {
+      staleButtons = 0;
+      staleMoveNoted = false;
+      noteMouse('stale-cleared');
+    }
+    if (staleButtons & event.buttons) {
+      if (!staleMoveNoted) {
+        staleMoveNoted = true;
+        noteMouse('stale-move', { buttons: event.buttons, staleButtons });
+      }
+      event.stopImmediatePropagation();
+      event.preventDefault();
+      return;
+    }
+    if (heldButtons.size === 0) return;
     // A synthesised release has to carry the pointer's position now, not where
     // the button went down: the client reads the coordinates off the mouseup.
     for (const input of heldButtons.values()) {
@@ -435,11 +488,11 @@ export function installGameInput({ canvas, touchMode = 'off', log }) {
     }
   }, true);
 
-  window.addEventListener('blur', releaseAll);
-  window.addEventListener('pagehide', releaseAll);
-  window.addEventListener('gw:input-reset', releaseAll);
+  window.addEventListener('blur', () => releaseAll('blur'));
+  window.addEventListener('pagehide', () => releaseAll('pagehide'));
+  window.addEventListener('gw:input-reset', () => releaseAll('host-reset'));
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') releaseAll();
+    if (document.visibilityState === 'hidden') releaseAll('hidden');
   });
 
   // Pixel deltas from trackpads become bounded pixel steps; discrete mouse
@@ -576,6 +629,7 @@ export function installGameInput({ canvas, touchMode = 'off', log }) {
       restX -= stepX;
       restY -= stepY;
       if ((!restX && !restY) || regrab === MAX_POINTER_REGRABS) return;
+      noteMouse('reanchor', { buttons });
       sendMouse('mouseup', rect, buttons & ~2, 2, 0, 0);
       virtualCursor = { x: rect.width / 2, y: rect.height / 2 };
       sendMouse('mousedown', rect, buttons, 2, 0, 0);
@@ -637,6 +691,7 @@ export function installGameInput({ canvas, touchMode = 'off', log }) {
   }, true);
   document.addEventListener('pointerlockchange', () => {
     const locked = document.pointerLockElement === canvas;
+    noteMouse('lock', { locked });
     canvas.classList.toggle('cursor-hidden', locked);
     if (locked && !pointerWanted) {
       document.exitPointerLock();
@@ -645,7 +700,7 @@ export function installGameInput({ canvas, touchMode = 'off', log }) {
       // going away. Unlike a refusal, this one has already been integrating
       // deltas, so the client's idea of where the cursor is no longer matches
       // anything on screen and the safe end is to let go of everything.
-      releaseButtons();
+      releaseButtons('pointer-lock-lost');
     }
   });
   document.addEventListener('pointerlockerror', () => {
@@ -653,8 +708,9 @@ export function installGameInput({ canvas, touchMode = 'off', log }) {
     pointerWanted = false;
     virtualCursor = null;
     canvas.classList.remove('cursor-hidden');
+    noteMouse('lock-error');
   });
-  document.documentElement.addEventListener('mouseleave', releaseAll);
+  document.documentElement.addEventListener('mouseleave', () => releaseAll('document-leave'));
 
   canvas.addEventListener('contextmenu', (event) => event.preventDefault());
   log(`input: touch mode ${touchMode}, ${layoutKeys.size} keys in the layout table`);
@@ -662,6 +718,9 @@ export function installGameInput({ canvas, touchMode = 'off', log }) {
 
   return Object.freeze({
     releaseAll,
+    getMouseDiagnostics() {
+      return mouseDiagnostics.map((entry) => ({ ...entry }));
+    },
     /** @param {{ touchMode?: string }} next */
     applySettings(next) {
       if (next.touchMode && next.touchMode !== touchMode) {

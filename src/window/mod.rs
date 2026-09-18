@@ -10,7 +10,7 @@
 //! dragged, and the state is small but not free to write, so a drag writes at
 //! most once a second and always writes once it settles.
 
-mod state;
+pub(crate) mod state;
 
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -99,12 +99,33 @@ pub fn open(
     requested_mode: Option<WindowMode>,
 ) -> Retained<NSWindow> {
     let (areas, primary) = work_areas(mtm);
-    let stored = load(&path);
+    let launch = std::env::var("GWNATIVE_LAUNCH_OPTIONS")
+        .ok()
+        .and_then(|value| {
+            serde_json::from_str::<crate::launcher_preferences::ResolvedLaunchOptions>(&value).ok()
+        });
+    let stored = match launch {
+        Some(options) => options.window_frame.map(|frame| State {
+            bounds: Bounds {
+                x: frame.x,
+                y: frame.y,
+                width: frame.width,
+                height: frame.height,
+            },
+            mode: Mode::Normal,
+        }),
+        None => load(&path),
+    };
     let mut state = match stored {
         Some(state) => fit(state, &areas, primary),
         None => default_state(primary),
     };
     state.mode = match requested_mode {
+        Some(WindowMode::Windowed)
+            if std::env::var("GWNATIVE_RESTORE_MAXIMIZED").as_deref() == Ok("1") =>
+        {
+            Mode::Maximized
+        }
         Some(WindowMode::Windowed) => Mode::Normal,
         Some(WindowMode::Fullscreen) => Mode::Fullscreen,
         None => state.mode,
@@ -260,6 +281,21 @@ pub fn reset(mtm: MainThreadMarker) {
         window.zoom(None);
     }
     window.setFrame_display_animate(bounds.to_rect(), true, true);
+}
+
+/// Capture on the game's main thread; never move the live window.
+pub fn capture_current_layout(request_id: &str) {
+    TRACKED.with(|tracked| {
+        if let Some(tracker) = tracked.borrow_mut().as_mut() {
+            let observed = observe(tracker);
+            let output = tracker.path.with_file_name("window-capture.json");
+            let stage = output.with_extension("json.tmp");
+            let value = serde_json::json!({"requestId":request_id,"frame":observed.bounds});
+            if std::fs::write(&stage, value.to_string()).is_ok() {
+                let _ = std::fs::rename(stage, output);
+            }
+        }
+    });
 }
 
 /// Write the tracked window's state now, whatever the coalescing interval says.

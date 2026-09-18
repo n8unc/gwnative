@@ -71,8 +71,48 @@ fn authorized(request: &Request, context: &Context) -> bool {
                 | token_matches(&context.tokens.game_reader, offered)
         }
         ("PUT", "__game/v1/state") => token_matches(&context.tokens.game_publisher, offered),
+        ("POST", "__character-observations") => {
+            token_matches(&context.tokens.game_publisher, offered)
+        }
         _ => token_matches(&context.tokens.browser, offered),
     }
+}
+
+fn character_observations(
+    request: &Request,
+    stream: &mut TcpStream,
+    context: &Context,
+) -> std::io::Result<()> {
+    let Ok(claim) =
+        serde_json::from_slice::<crate::character_bridge::ObservationClaim>(&request.body)
+    else {
+        return empty_response(stream, 400, "text/plain");
+    };
+    if !context.launch.matches_session(&claim.session_id) {
+        return empty_response(stream, 403, "text/plain");
+    }
+    if claim.names.iter().any(|name| {
+        token_matches(&context.launch.nonce, Some(name))
+            || token_matches(&context.tokens.browser, Some(name))
+            || token_matches(&context.tokens.game_publisher, Some(name))
+    }) {
+        return empty_response(stream, 400, "text/plain");
+    }
+    // The launch nonce is capability material and cannot pass through the
+    // ordinary untrusted-body lease. Check only names here: they are the sole
+    // durable data this route permits and protected values fail closed.
+    let Ok(names) = serde_json::to_vec(&claim.names) else {
+        return empty_response(stream, 400, "text/plain");
+    };
+    let Some(_lease) = crate::log::admit_untrusted(&names) else {
+        return empty_response(stream, 400, "text/plain");
+    };
+    if crate::character_bridge::save_observations(&context.profile_support_dir, claim.names)
+        .is_err()
+    {
+        return empty_response(stream, 400, "text/plain");
+    }
+    no_content(stream)
 }
 
 /// These closed, exact launch-state schemas carry only values already selected
@@ -118,6 +158,7 @@ pub(super) fn serve(
     // files, reports, or another durable/memory sink.
     let _untrusted_lease = if request.path != "__credentials"
         && !runtime_control(&request.path)
+        && request.path != "__character-observations"
         && !request.body.is_empty()
     {
         let Some(lease) = crate::log::admit_untrusted(&request.body) else {
@@ -166,6 +207,9 @@ pub(super) fn serve(
         }
         "__game/v1" => game_description(request, stream, context)?,
         "__game/v1/state" => game_state(request, stream, context)?,
+        "__character-observations" if request.method == "POST" => {
+            character_observations(request, stream, context)?
+        }
         "__game/v1/actions" => text(
             stream,
             409,

@@ -91,6 +91,16 @@ export const GUIDE = [
     ],
   },
   {
+    heading: 'Accounts, groups and textures',
+    body: [
+      'Each Account keeps its own next-launch choices: sound, frame-rate limit, window mode, layout, preferred character and texture packs. They apply when that Account next starts. Capture layout copies the running game’s current window position and size for a later launch; it does not move the game that is already open.',
+      'A launch group starts its Accounts in the order you saved. Every member keeps its own next-launch choices, so changing one Account does not change the others. Last seen characters are only suggestions: the launcher checks the live character list again before using one.',
+      'Choose a preferred character to have the launcher select and enter it when the game reaches character selection. This is available only on an exact recognised JSPI client build; Asyncify and an unrecognised build leave character choice to you. If the selection cannot be confirmed, the game stays at character selection.',
+      'Texture packs are discovered automatically from the selected texture folder. Choose packs for each Account and arrange them in order: when two packs replace the same texture, the first one wins. Removing a pack later does not change a running game because it keeps the revision it started with; if a replacement cannot be used, the original game texture appears instead.',
+      'This release accepts legacy 32-bit TexMod TPF packs. It does not claim support for arbitrary uMod containers.',
+    ],
+  },
+  {
     heading: 'Enhancements',
     body: [
       'Two read-only extras in Settings. Game cursor is on by default; Target distance ' +

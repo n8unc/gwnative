@@ -13,11 +13,13 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use objc2_foundation::NSUUID;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::instance;
+use crate::launcher_preferences::AccountLaunchPreferences;
 
-const FORMAT: u32 = 1;
+const ACCOUNT_FORMAT: u32 = 1;
+const CATALOG_FORMAT: u32 = 2;
 const CATALOG_DIR: &str = "launcher";
 const CATALOG_FILE: &str = "accounts.json";
 const LOCK_FILE: &str = "accounts.lock";
@@ -155,6 +157,8 @@ pub struct Account {
     pub auto_login: bool,
     pub auto_launch: bool,
     pub has_password: bool,
+    #[serde(default, deserialize_with = "preferences_or_default")]
+    pub launch_preferences: AccountLaunchPreferences,
 }
 
 /// Input for adding an Account. `profile_id` is supplied for adoption; normal
@@ -199,7 +203,24 @@ pub struct AccountPatch {
     pub email: Option<String>,
     pub auto_login: Option<bool>,
     pub auto_launch: Option<bool>,
+    pub launch_preferences: Option<AccountLaunchPreferences>,
     pub preserve_context: bool,
+}
+
+/// Saved ordered references to Accounts. Groups never copy identity or
+/// credentials, and missing IDs remain representable for imported catalogs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchGroup {
+    pub id: String,
+    pub name: String,
+    pub account_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaunchGroupDraft {
+    pub name: String,
+    pub account_ids: Vec<String>,
 }
 
 /// Password operation submitted with one complete launcher form.
@@ -272,6 +293,56 @@ impl<S: CredentialStore> AccountRepository<S> {
         Ok(self.read_state()?.retained)
     }
 
+    pub fn groups(&self) -> Result<Vec<LaunchGroup>, String> {
+        let _lock = self.lock()?;
+        Ok(self.read_state()?.groups)
+    }
+
+    pub fn create_group(&self, draft: LaunchGroupDraft) -> Result<LaunchGroup, String> {
+        let _lock = self.lock()?;
+        let mut state = self.read_state()?;
+        let group = LaunchGroup {
+            id: new_id(),
+            name: clean_group_name(&draft.name)?,
+            account_ids: draft.account_ids,
+        };
+        validate_group(&group)?;
+        state.groups.push(group.clone());
+        self.write_catalog(&state.accounts, &state.retained, &state.groups)?;
+        Ok(group)
+    }
+
+    pub fn update_group(&self, id: &str, draft: LaunchGroupDraft) -> Result<LaunchGroup, String> {
+        let _lock = self.lock()?;
+        let mut state = self.read_state()?;
+        let index = state
+            .groups
+            .iter()
+            .position(|group| group.id == id)
+            .ok_or_else(|| format!("unknown launch group {id:?}"))?;
+        let group = LaunchGroup {
+            id: id.to_owned(),
+            name: clean_group_name(&draft.name)?,
+            account_ids: draft.account_ids,
+        };
+        validate_group(&group)?;
+        state.groups[index] = group.clone();
+        self.write_catalog(&state.accounts, &state.retained, &state.groups)?;
+        Ok(group)
+    }
+
+    pub fn delete_group(&self, id: &str) -> Result<bool, String> {
+        let _lock = self.lock()?;
+        let mut state = self.read_state()?;
+        let before = state.groups.len();
+        state.groups.retain(|group| group.id != id);
+        if state.groups.len() == before {
+            return Ok(false);
+        }
+        self.write_catalog(&state.accounts, &state.retained, &state.groups)?;
+        Ok(true)
+    }
+
     pub fn credential_preview(&self, profile_id: &str) -> Result<CredentialPreview, String> {
         let credentials = self.credentials.read(profile_id)?;
         Ok(CredentialPreview {
@@ -290,7 +361,7 @@ impl<S: CredentialStore> AccountRepository<S> {
             .ok_or_else(|| format!("unknown retained Account {id:?}"))?;
         let _profile_lock = busy.acquire_exclusive(&state.retained[index].profile_id)?;
         state.retained.remove(index);
-        self.write_catalog(&state.accounts, &state.retained)
+        self.write_catalog(&state.accounts, &state.retained, &state.groups)
     }
 
     #[cfg(test)]
@@ -342,7 +413,7 @@ impl<S: CredentialStore> AccountRepository<S> {
         }
         let auto_login = draft.auto_login.unwrap_or(has_password) && has_password;
         let account = Account {
-            format_version: FORMAT,
+            format_version: ACCOUNT_FORMAT,
             id,
             profile_id,
             nickname,
@@ -350,6 +421,7 @@ impl<S: CredentialStore> AccountRepository<S> {
             auto_login,
             auto_launch: draft.auto_launch,
             has_password: false,
+            launch_preferences: AccountLaunchPreferences::default(),
         };
         prepare(&account.profile_id)?;
         let old_credentials = self.credentials.read(&account.profile_id)?;
@@ -373,7 +445,7 @@ impl<S: CredentialStore> AccountRepository<S> {
         state
             .retained
             .retain(|value| value.profile_id != account.profile_id);
-        if let Err(error) = self.write_catalog(&state.accounts, &state.retained) {
+        if let Err(error) = self.write_catalog(&state.accounts, &state.retained, &state.groups) {
             if let Some(old) = old_credentials {
                 let _ = self
                     .credentials
@@ -432,6 +504,9 @@ impl<S: CredentialStore> AccountRepository<S> {
             }
             next.auto_login = auto_login;
         }
+        if let Some(preferences) = patch.launch_preferences {
+            next.launch_preferences = preferences;
+        }
 
         if email_changed {
             let _profile_lock = busy.acquire_exclusive(&current.profile_id)?;
@@ -440,7 +515,8 @@ impl<S: CredentialStore> AccountRepository<S> {
                 self.credentials.clear(&current.profile_id)?;
             }
             accounts[index] = next.clone();
-            if let Err(error) = self.write_catalog(&state.accounts, &state.retained) {
+            if let Err(error) = self.write_catalog(&state.accounts, &state.retained, &state.groups)
+            {
                 if let Some(old) = old_credentials {
                     let _ =
                         self.credentials
@@ -452,7 +528,7 @@ impl<S: CredentialStore> AccountRepository<S> {
         }
 
         accounts[index] = next.clone();
-        self.write_catalog(&state.accounts, &state.retained)?;
+        self.write_catalog(&state.accounts, &state.retained, &state.groups)?;
         Ok(next)
     }
 
@@ -504,6 +580,9 @@ impl<S: CredentialStore> AccountRepository<S> {
         if let Some(auto_login) = patch.auto_login {
             next.auto_login = auto_login;
         }
+        if let Some(preferences) = patch.launch_preferences {
+            next.launch_preferences = preferences;
+        }
         match &password {
             PasswordChange::Keep if email_changed => {
                 next.has_password = false;
@@ -553,7 +632,7 @@ impl<S: CredentialStore> AccountRepository<S> {
             }
         }
         state.accounts = candidate;
-        if let Err(error) = self.write_catalog(&state.accounts, &state.retained) {
+        if let Err(error) = self.write_catalog(&state.accounts, &state.retained, &state.groups) {
             if let Some(old) = old_credentials {
                 let _ = self
                     .credentials
@@ -588,7 +667,7 @@ impl<S: CredentialStore> AccountRepository<S> {
         let mut next = current.clone();
         next.has_password = true;
         accounts[index] = next.clone();
-        if let Err(error) = self.write_catalog(&state.accounts, &state.retained) {
+        if let Err(error) = self.write_catalog(&state.accounts, &state.retained, &state.groups) {
             if let Some(old) = old_credentials {
                 let _ = self
                     .credentials
@@ -615,7 +694,7 @@ impl<S: CredentialStore> AccountRepository<S> {
         next.has_password = false;
         next.auto_login = false;
         accounts[index] = next.clone();
-        if let Err(error) = self.write_catalog(&state.accounts, &state.retained) {
+        if let Err(error) = self.write_catalog(&state.accounts, &state.retained, &state.groups) {
             if let Some(old) = old_credentials {
                 let _ = self
                     .credentials
@@ -639,13 +718,16 @@ impl<S: CredentialStore> AccountRepository<S> {
         let credentials_cleared = old_credentials.is_some();
         self.credentials.clear(&account.profile_id)?;
         accounts.remove(index);
+        for group in &mut state.groups {
+            group.account_ids.retain(|member| member != &account.id);
+        }
         state.retained.push(RetainedAccount {
             id: account.id.clone(),
             profile_id: account.profile_id.clone(),
             nickname: account.nickname.clone(),
             email: account.email.clone(),
         });
-        if let Err(error) = self.write_catalog(&state.accounts, &state.retained) {
+        if let Err(error) = self.write_catalog(&state.accounts, &state.retained, &state.groups) {
             if let Some(old) = old_credentials {
                 let _ = self
                     .credentials
@@ -685,7 +767,7 @@ impl<S: CredentialStore> AccountRepository<S> {
         };
         let file: Catalog = serde_json::from_slice(&bytes)
             .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
-        if file.format_version != FORMAT {
+        if !(1..=CATALOG_FORMAT).contains(&file.format_version) {
             return Err(format!(
                 "{} uses unsupported account format {}",
                 path.display(),
@@ -694,9 +776,11 @@ impl<S: CredentialStore> AccountRepository<S> {
         }
         validate_accounts(&file.accounts)?;
         validate_retained(&file.retained)?;
+        validate_groups(&file.groups)?;
         Ok(CatalogState {
             accounts: file.accounts,
             retained: file.retained,
+            groups: file.groups,
         })
     }
 
@@ -704,17 +788,20 @@ impl<S: CredentialStore> AccountRepository<S> {
         &self,
         accounts: &[Account],
         retained: &[RetainedAccount],
+        groups: &[LaunchGroup],
     ) -> Result<(), String> {
         validate_accounts(accounts)?;
         validate_retained(retained)?;
+        validate_groups(groups)?;
         let path = self.catalog_path();
         let parent = path.parent().expect("catalog has a parent");
         fs::create_dir_all(parent)
             .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
         let bytes = serde_json::to_vec_pretty(&Catalog {
-            format_version: FORMAT,
+            format_version: CATALOG_FORMAT,
             accounts: accounts.to_vec(),
             retained: retained.to_vec(),
+            groups: groups.to_vec(),
         })
         .map_err(|error| error.to_string())?;
         let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
@@ -743,12 +830,15 @@ struct Catalog {
     accounts: Vec<Account>,
     #[serde(default)]
     retained: Vec<RetainedAccount>,
+    #[serde(default)]
+    groups: Vec<LaunchGroup>,
 }
 
 #[derive(Default)]
 struct CatalogState {
     accounts: Vec<Account>,
     retained: Vec<RetainedAccount>,
+    groups: Vec<LaunchGroup>,
 }
 
 fn new_id() -> String {
@@ -776,6 +866,52 @@ fn clean_email(value: &str) -> Result<String, String> {
         return Err("login email cannot be empty or contain control characters".into());
     }
     Ok(value.to_owned())
+}
+
+fn clean_group_name(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err("group name cannot be empty or contain a control character".into());
+    }
+    Ok(value.to_owned())
+}
+
+/// Preferences are noncritical metadata. Older or manually damaged values
+/// must not hide an otherwise usable Account catalog; retain safe defaults.
+fn preferences_or_default<'de, D>(deserializer: D) -> Result<AccountLaunchPreferences, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
+fn validate_group(group: &LaunchGroup) -> Result<(), String> {
+    if group.id.trim().is_empty() {
+        return Err("launch group has empty ID".into());
+    }
+    clean_group_name(&group.name)?;
+    if group.account_ids.iter().any(|id| id.trim().is_empty()) {
+        return Err(format!("launch group {:?} has empty Account ID", group.id));
+    }
+    if group.account_ids.iter().enumerate().any(|(index, id)| {
+        group.account_ids[..index]
+            .iter()
+            .any(|earlier| earlier == id)
+    }) {
+        return Err(format!("launch group {:?} repeats an Account ID", group.id));
+    }
+    Ok(())
+}
+
+fn validate_groups(groups: &[LaunchGroup]) -> Result<(), String> {
+    for (index, group) in groups.iter().enumerate() {
+        validate_group(group)?;
+        if groups[..index].iter().any(|earlier| earlier.id == group.id) {
+            return Err(format!("duplicate launch group ID {:?}", group.id));
+        }
+    }
+    Ok(())
 }
 
 fn email_key(value: &str) -> String {
@@ -817,7 +953,7 @@ fn validate_accounts(accounts: &[Account]) -> Result<(), String> {
     let mut ids = Vec::new();
     let mut profiles = Vec::new();
     for account in accounts {
-        if account.format_version != FORMAT {
+        if account.format_version != ACCOUNT_FORMAT {
             return Err(format!("Account {:?} uses unsupported format", account.id));
         }
         if account.id.trim().is_empty() || ids.iter().any(|id| id == &account.id) {
@@ -834,6 +970,7 @@ fn validate_accounts(accounts: &[Account]) -> Result<(), String> {
             ));
         }
         clean_nickname(&account.nickname)?;
+        validate_preferences(&account.launch_preferences)?;
         let email = clean_email(&account.email)?;
         ensure_unique_email(accounts, &email, Some(&account.id))?;
         if account.auto_login && !account.has_password {
@@ -846,6 +983,10 @@ fn validate_accounts(accounts: &[Account]) -> Result<(), String> {
         profiles.push(account.profile_id.clone());
     }
     Ok(())
+}
+
+fn validate_preferences(preferences: &AccountLaunchPreferences) -> Result<(), String> {
+    crate::launcher_preferences::validate_account_launch_preferences(preferences)
 }
 
 fn validate_retained(retained: &[RetainedAccount]) -> Result<(), String> {
@@ -1107,6 +1248,134 @@ mod tests {
         assert_eq!(repo.retained().unwrap()[0].profile_id, account.profile_id);
         repo.forget_retained(&account.id, &NoBusyProfiles).unwrap();
         assert!(repo.retained().unwrap().is_empty());
+    }
+
+    #[test]
+    fn groups_preserve_order_and_account_removal_cleans_members_in_same_catalog() {
+        let (_temp, repo) = repo();
+        let first = repo
+            .create(draft("one@example.test"), &NoBusyProfiles)
+            .unwrap();
+        let second = repo
+            .create(draft("two@example.test"), &NoBusyProfiles)
+            .unwrap();
+        let group = repo
+            .create_group(LaunchGroupDraft {
+                name: "Daily run".into(),
+                account_ids: vec![second.id.clone(), first.id.clone()],
+            })
+            .unwrap();
+        assert_eq!(repo.groups().unwrap(), vec![group.clone()]);
+        repo.remove(&second.id, &NoBusyProfiles).unwrap();
+        assert_eq!(
+            repo.groups().unwrap()[0].account_ids,
+            vec![first.id.clone()]
+        );
+        let catalog: serde_json::Value =
+            serde_json::from_slice(&fs::read(repo.catalog_path()).unwrap()).unwrap();
+        assert_eq!(
+            catalog["groups"][0]["accountIds"],
+            serde_json::json!([first.id])
+        );
+    }
+
+    #[test]
+    fn groups_reject_duplicate_members_but_keep_unknown_imported_members() {
+        let (_temp, repo) = repo();
+        let error = repo
+            .create_group(LaunchGroupDraft {
+                name: "Bad".into(),
+                account_ids: vec!["gone".into(), "gone".into()],
+            })
+            .unwrap_err();
+        assert!(error.contains("repeats"));
+        let group = repo
+            .create_group(LaunchGroupDraft {
+                name: "Imported".into(),
+                account_ids: vec!["missing-account".into()],
+            })
+            .unwrap();
+        assert_eq!(repo.groups().unwrap(), vec![group]);
+    }
+
+    #[test]
+    fn concurrent_group_writes_are_serialized_without_losing_a_group() {
+        let (temp, repo) = repo();
+        let base = temp.0.clone();
+        let first = std::thread::spawn({
+            let base = base.clone();
+            move || {
+                AccountRepository::with_credentials(base, FakeCredentials::default())
+                    .create_group(LaunchGroupDraft {
+                        name: "First".into(),
+                        account_ids: vec![],
+                    })
+                    .unwrap()
+            }
+        });
+        let second = std::thread::spawn(move || {
+            AccountRepository::with_credentials(base, FakeCredentials::default())
+                .create_group(LaunchGroupDraft {
+                    name: "Second".into(),
+                    account_ids: vec![],
+                })
+                .unwrap()
+        });
+        let mut ids = vec![first.join().unwrap().id, second.join().unwrap().id];
+        ids.sort();
+        let mut saved = repo
+            .groups()
+            .unwrap()
+            .into_iter()
+            .map(|group| group.id)
+            .collect::<Vec<_>>();
+        saved.sort();
+        assert_eq!(saved, ids);
+    }
+
+    #[test]
+    fn account_preferences_round_trip_without_credential_material() {
+        let (_temp, repo) = repo();
+        let account = repo
+            .create(draft("one@example.test"), &NoBusyProfiles)
+            .unwrap();
+        let preferences = AccountLaunchPreferences {
+            muted: Some(true),
+            preferred_character: Some("Koss".into()),
+            texture_pack_ids: vec!["minimalus-v3".into(), "hud".into()],
+            ..Default::default()
+        };
+        repo.update(
+            &account.id,
+            AccountPatch {
+                launch_preferences: Some(preferences.clone()),
+                ..Default::default()
+            },
+            &NoBusyProfiles,
+        )
+        .unwrap();
+        assert_eq!(repo.list().unwrap()[0].launch_preferences, preferences);
+        let json = fs::read_to_string(repo.catalog_path()).unwrap();
+        assert!(json.contains("preferredCharacter"));
+        assert!(!json.contains("secret"));
+    }
+
+    #[test]
+    fn malformed_stored_preferences_fall_back_to_defaults() {
+        let (_temp, repo) = repo();
+        let account = repo
+            .create(draft("one@example.test"), &NoBusyProfiles)
+            .unwrap();
+        let mut catalog: serde_json::Value =
+            serde_json::from_slice(&fs::read(repo.catalog_path()).unwrap()).unwrap();
+        catalog["accounts"][0]["launchPreferences"] =
+            serde_json::json!({"frameRateLimit":{"limit":"bad"}});
+        fs::write(repo.catalog_path(), serde_json::to_vec(&catalog).unwrap()).unwrap();
+        assert_eq!(repo.list().unwrap()[0].id, account.id);
+        assert_eq!(
+            repo.list().unwrap()[0].launch_preferences,
+            AccountLaunchPreferences::default()
+        );
     }
 
     #[test]

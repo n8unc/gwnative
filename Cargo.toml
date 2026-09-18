@@ -44,6 +44,7 @@ security-framework = { version = "3", default-features = false }
 # does not wrap — the switch that stops the keychain putting a password dialog
 # on screen. See src/keychain.rs.
 security-framework-sys = "2"
+png = "0.17"
 
 [profile.release]
 opt-level = 3

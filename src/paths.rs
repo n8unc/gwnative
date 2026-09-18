@@ -100,6 +100,26 @@ pub fn base_support_dir() -> PathBuf {
     PathBuf::from(home).join("Library/Application Support/gwnative")
 }
 
+/// User-owned texture sources never depend on the launcher's working directory.
+pub fn texture_source_dir(base: &Path, selected: Option<&Path>) -> PathBuf {
+    let packaged = std::env::current_exe().ok().is_some_and(|exe| {
+        exe.ancestors()
+            .any(|part| part.extension().is_some_and(|ext| ext == "app"))
+    });
+    texture_source_plan(base, selected, packaged)
+}
+
+fn texture_source_plan(base: &Path, selected: Option<&Path>, packaged: bool) -> PathBuf {
+    if let Some(path) = selected.filter(|p| p.is_absolute()) {
+        return path.to_owned();
+    }
+    if packaged {
+        base.join("texturepacks")
+    } else {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("texturepacks")
+    }
+}
+
 /// Verified artifact-certificate updates, separate from derived modules so
 /// clearing one never rolls the other back.
 pub fn certificate_dir() -> PathBuf {
@@ -159,6 +179,27 @@ pub(crate) fn is_shell_file(name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::cli;
+
+    #[test]
+    fn texture_sources_are_shared_and_independent_of_cwd() {
+        let base = Path::new("/tmp/shared");
+        assert_eq!(
+            texture_source_plan(base, None, true),
+            base.join("texturepacks")
+        );
+        assert_eq!(
+            texture_source_plan(base, None, false),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("texturepacks")
+        );
+        assert_eq!(
+            texture_source_plan(base, Some(Path::new("/tmp/custom")), true),
+            PathBuf::from("/tmp/custom")
+        );
+        assert_eq!(
+            texture_source_plan(base, Some(Path::new("relative")), true),
+            base.join("texturepacks")
+        );
+    }
 
     #[test]
     fn named_profiles_isolate_mutable_state_and_share_chunks() {

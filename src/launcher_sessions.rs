@@ -35,14 +35,18 @@ const VERSION: u32 = 1;
 const IPC_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_REQUEST_BYTES: u64 = 512;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LaunchSpec {
     pub profile_id: String,
     pub args: Vec<String>,
+    /// Frozen, nonsecret child environment. Values are set explicitly rather
+    /// than inherited from mutable launcher state.
+    pub env: BTreeMap<String, String>,
+    pub options: crate::launcher_preferences::ResolvedLaunchOptions,
 }
 
 impl LaunchSpec {
-    fn game(executable: &Path, profile_id: &str) -> Self {
+    pub fn game(executable: &Path, profile_id: &str) -> Self {
         Self {
             profile_id: profile_id.into(),
             args: vec![
@@ -52,6 +56,15 @@ impl LaunchSpec {
                 profile_id.into(),
                 "--new-instance".into(),
             ],
+            env: BTreeMap::new(),
+            options: crate::launcher_preferences::ResolvedLaunchOptions {
+                muted: false,
+                frame_rate_limit: crate::launcher_preferences::FrameRateLimit::Default,
+                window_mode: crate::launcher_preferences::WindowMode::Windowed,
+                window_frame: None,
+                preferred_character: None,
+                texture_pack_ids: Vec::new(),
+            },
         }
     }
 }
@@ -80,7 +93,7 @@ pub struct CurrentExecutable {
 
 impl CurrentExecutable {
     /// Preserve launcher update policy without inheriting arbitrary environment.
-    pub fn with_game_options(offline: bool, no_update: bool, mute: bool) -> Self {
+    pub fn with_game_options(offline: bool, no_update: bool, _mute: bool) -> Self {
         let mut game_options = Vec::new();
         if offline {
             game_options.push("--offline".into());
@@ -88,14 +101,30 @@ impl CurrentExecutable {
         if no_update {
             game_options.push("--no-update".into());
         }
-        if mute {
-            game_options.push("-nosound".into());
-        }
         Self {
             children: BTreeMap::new(),
             game_options,
         }
     }
+}
+
+fn supported_option_args(
+    options: &crate::launcher_preferences::ResolvedLaunchOptions,
+) -> Vec<String> {
+    use crate::launcher_preferences::{FrameRateLimit, WindowMode};
+    let mut args = Vec::new();
+    if options.muted {
+        args.push("-nosound".into());
+    }
+    if let FrameRateLimit::Limit(limit) = options.frame_rate_limit {
+        args.push("-fps".into());
+        args.push(limit.to_string());
+    }
+    match options.window_mode {
+        WindowMode::Windowed => args.push("-windowed".into()),
+        WindowMode::Fullscreen => args.push("-windowedfullscreen".into()),
+    }
+    args
 }
 
 impl GameRunner for CurrentExecutable {
@@ -105,18 +134,31 @@ impl GameRunner for CurrentExecutable {
             .first()
             .ok_or_else(|| "game launch omitted executable".to_owned())?;
         let mut command = Command::new(executable);
-        let child = command
-            .args(&spec.args[1..])
-            .args(&self.game_options)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            // Launcher process must not donate a temporary origin, source-tree
-            // shell, or benchmark storage mode to independently launched game.
+        // Clear inherited launch-scoped values before installing this child's
+        // frozen map. A caller may deliberately supply WINDOW_SNAPSHOT.
+        command
             .env_remove("GWNATIVE_PORT")
             .env_remove("GWNATIVE_WEB_ROOT")
             .env_remove("GWNATIVE_BENCHMARK_EPHEMERAL_WEBKIT")
             .env_remove("GWNATIVE_CONTROL_FD")
+            .env_remove("GWNATIVE_ACCOUNT_AUTO_LOGIN")
+            .env_remove("GWNATIVE_TEXTURE_MANIFEST")
+            .env_remove("GWNATIVE_RESTORE_MAXIMIZED")
+            .env_remove("GWNATIVE_LAUNCH_OPTIONS")
+            .env_remove("GWNATIVE_WINDOW_SNAPSHOT");
+        let child = command
+            .args(&spec.args[1..])
+            .args(&self.game_options)
+            .args(supported_option_args(&spec.options))
+            .envs(&spec.env)
+            .env(
+                "GWNATIVE_LAUNCH_OPTIONS",
+                serde_json::to_string(&spec.options)
+                    .map_err(|error| format!("could not serialize launch options: {error}"))?,
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             // Parent holds profile lock until nonce and child identity record
             // are atomically published. Child waits for this short reservation.
             .env("GWNATIVE_LAUNCHER_STARTING", "1")
@@ -193,10 +235,11 @@ pub trait SessionProbe {
     fn profile_locked(&self, support_dir: &Path) -> Result<bool, String>;
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostCommand {
     Show,
     Close,
+    CaptureWindowLayout { request_id: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -224,11 +267,13 @@ struct Managed {
     close_requested: bool,
     close_target_identity: Option<String>,
     state: SessionState,
+    launch_spec: Option<LaunchSpec>,
 }
 
 /// One queue for one launcher.  Profile map enforces one game lifecycle per
 /// profile, including repeated clicks and reconnect after launcher restart.
 pub struct SessionController<R, P> {
+    #[cfg(test)]
     executable: PathBuf,
     runner: R,
     probe: P,
@@ -238,7 +283,10 @@ pub struct SessionController<R, P> {
 
 impl<R: GameRunner, P: SessionProbe> SessionController<R, P> {
     pub fn new(executable: PathBuf, runner: R, probe: P) -> Self {
+        #[cfg(not(test))]
+        let _ = executable;
         Self {
+            #[cfg(test)]
             executable,
             runner,
             probe,
@@ -248,19 +296,27 @@ impl<R: GameRunner, P: SessionProbe> SessionController<R, P> {
     }
 
     /// Request a game only when profile has no live, starting, or queued game.
+    #[cfg(test)]
     pub fn request(&mut self, profile_id: &str, support_dir: PathBuf) -> bool {
-        if !valid_profile_id(profile_id) {
+        self.request_spec(LaunchSpec::game(&self.executable, profile_id), support_dir)
+    }
+
+    /// Queue an immutable per-child snapshot. Later Account/preference edits
+    /// cannot alter a request already admitted to this controller.
+    pub fn request_spec(&mut self, spec: LaunchSpec, support_dir: PathBuf) -> bool {
+        let profile_id = spec.profile_id.clone();
+        if !valid_profile_id(&profile_id) {
             return false;
         }
-        if let Some(existing) = self.sessions.get(profile_id) {
+        if let Some(existing) = self.sessions.get(&profile_id) {
             if existing.pid.is_some() || !matches!(existing.state, SessionState::Failed { .. }) {
                 return false;
             }
-            self.sessions.remove(profile_id);
+            self.sessions.remove(&profile_id);
         }
         let nonce = nonce();
         self.sessions.insert(
-            profile_id.into(),
+            profile_id.clone(),
             Managed {
                 support_dir,
                 nonce,
@@ -270,9 +326,10 @@ impl<R: GameRunner, P: SessionProbe> SessionController<R, P> {
                 close_requested: false,
                 close_target_identity: None,
                 state: SessionState::Queued,
+                launch_spec: Some(spec),
             },
         );
-        self.queue.push_back(profile_id.into());
+        self.queue.push_back(profile_id);
         true
     }
 
@@ -348,6 +405,7 @@ impl<R: GameRunner, P: SessionProbe> SessionController<R, P> {
                     close_requested: false,
                     close_target_identity: None,
                     state: SessionState::AwaitingWindow,
+                    launch_spec: None,
                 },
             );
             return Ok(true);
@@ -373,6 +431,7 @@ impl<R: GameRunner, P: SessionProbe> SessionController<R, P> {
                 } else {
                     SessionState::AwaitingWindow
                 },
+                launch_spec: None,
             },
         );
         Ok(true)
@@ -415,10 +474,13 @@ impl<R: GameRunner, P: SessionProbe> SessionController<R, P> {
             session.state = SessionState::Failed { reason: error };
             return;
         }
-        match self
-            .runner
-            .spawn(&LaunchSpec::game(&self.executable, &profile_id))
-        {
+        let Some(spec) = session.launch_spec.clone() else {
+            session.state = SessionState::Failed {
+                reason: "queued session omitted launch snapshot".into(),
+            };
+            return;
+        };
+        match self.runner.spawn(&spec) {
             Ok(pid) => {
                 let Some(identity) = self.runner.process_identity(pid) else {
                     let cleanup = self.runner.terminate_reap(pid);
@@ -485,6 +547,24 @@ impl<R: GameRunner, P: SessionProbe> SessionController<R, P> {
 
     pub fn show(&mut self, profile_id: &str) -> Result<bool, String> {
         self.request_command(profile_id, HostCommand::Show)
+    }
+
+    pub fn capture_window_layout(
+        &self,
+        profile_id: &str,
+        request_id: &str,
+    ) -> Result<bool, String> {
+        if !valid_capture_request_id(request_id) {
+            return Err(
+                "window-layout capture request ID must be 32 hexadecimal characters".into(),
+            );
+        }
+        self.request_command(
+            profile_id,
+            HostCommand::CaptureWindowLayout {
+                request_id: request_id.into(),
+            },
+        )
     }
 
     /// Orderly close only.  Force quit deliberately remains separate UI action.
@@ -850,11 +930,11 @@ impl GameHost {
         let Some(verb) = fields.next() else {
             return Ok(None);
         };
-        if fields.next().is_some() || token != self.nonce {
+        if token != self.nonce {
             return Ok(None);
         }
         let command = match verb {
-            "state" => {
+            "state" if fields.next().is_none() => {
                 writeln!(
                     stream,
                     "ok {} {} {} {}",
@@ -866,8 +946,20 @@ impl GameHost {
                 .map_err(|error| format!("could not reply to game session probe: {error}"))?;
                 return Ok(None);
             }
-            "show" => HostCommand::Show,
-            "close" => HostCommand::Close,
+            "show" if fields.next().is_none() => HostCommand::Show,
+            "close" if fields.next().is_none() => HostCommand::Close,
+            "capture-window-layout" => {
+                let Some(request_id) = fields.next().filter(|id| valid_capture_request_id(id))
+                else {
+                    return Ok(None);
+                };
+                if fields.next().is_some() {
+                    return Ok(None);
+                }
+                HostCommand::CaptureWindowLayout {
+                    request_id: request_id.into(),
+                }
+            }
             _ => return Ok(None),
         };
         writeln!(stream, "ok")
@@ -946,9 +1038,12 @@ impl SessionProbe for IpcProbe {
         expected_nonce: &str,
         command: HostCommand,
     ) -> Result<(), String> {
-        let verb = match command {
-            HostCommand::Show => "show",
-            HostCommand::Close => "close",
+        let (verb, argument) = match command {
+            HostCommand::Show => ("show", None),
+            HostCommand::Close => ("close", None),
+            HostCommand::CaptureWindowLayout { request_id } => {
+                ("capture-window-layout", Some(request_id))
+            }
         };
         let mut stream = UnixStream::connect(socket_path(expected_nonce))
             .map_err(|error| format!("could not reach game session: {error}"))?;
@@ -958,8 +1053,12 @@ impl SessionProbe for IpcProbe {
         stream
             .set_write_timeout(Some(IPC_TIMEOUT))
             .map_err(|error| format!("could not bound game-session write: {error}"))?;
-        writeln!(stream, "{expected_nonce} {verb}")
-            .map_err(|error| format!("could not send game session command: {error}"))?;
+        if let Some(argument) = argument {
+            writeln!(stream, "{expected_nonce} {verb} {argument}")
+        } else {
+            writeln!(stream, "{expected_nonce} {verb}")
+        }
+        .map_err(|error| format!("could not send game session command: {error}"))?;
         let mut response = String::new();
         BufReader::new(stream)
             .take(MAX_REQUEST_BYTES)
@@ -1044,6 +1143,10 @@ fn valid_profile_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn valid_capture_request_id(value: &str) -> bool {
+    value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn valid_nonce(value: &str) -> bool {
@@ -1261,6 +1364,31 @@ mod tests {
     }
 
     #[test]
+    fn queued_spec_keeps_its_options_and_environment_snapshot() {
+        let mut controller = controller();
+        let mut spec = LaunchSpec::game(&controller.executable, "frozen");
+        spec.options.muted = true;
+        spec.options.preferred_character = Some("Koss".into());
+        spec.env
+            .insert("GWNATIVE_TEXTURE_MANIFEST".into(), "revision-a".into());
+        assert!(controller.request_spec(spec, path("frozen")));
+        controller.tick();
+        let launched = &controller.runner.launches[0];
+        assert!(launched.options.muted);
+        assert_eq!(
+            launched.options.preferred_character.as_deref(),
+            Some("Koss")
+        );
+        assert_eq!(
+            launched
+                .env
+                .get("GWNATIVE_TEXTURE_MANIFEST")
+                .map(String::as_str),
+            Some("revision-a")
+        );
+    }
+
+    #[test]
     fn current_executable_forwards_mute_to_child_argv() {
         use std::os::unix::fs::OpenOptionsExt;
 
@@ -1282,7 +1410,8 @@ mod tests {
             invocation.no_update,
             invocation.legacy.mute,
         );
-        let spec = LaunchSpec::game(&script, "fixture");
+        let mut spec = LaunchSpec::game(&script, "fixture");
+        spec.options.muted = true;
         let pid = runner.spawn(&spec).expect("spawn argv fixture");
         for _ in 0..100 {
             if runner.exited(pid).expect("observe argv fixture") == Some(true) {
@@ -1298,6 +1427,79 @@ mod tests {
                 .any(|arg| arg.contains("password") || arg.contains("email"))
         );
 
+        let _ = std::fs::remove_file(script);
+        let _ = std::fs::remove_file(output);
+    }
+
+    #[test]
+    fn resolved_launch_arguments_are_ordered_and_never_transport_character() {
+        let options = crate::launcher_preferences::ResolvedLaunchOptions {
+            muted: true,
+            frame_rate_limit: crate::launcher_preferences::FrameRateLimit::Limit(144),
+            window_mode: crate::launcher_preferences::WindowMode::Fullscreen,
+            window_frame: None,
+            preferred_character: Some("Koss".into()),
+            texture_pack_ids: vec!["tpf:ui".into()],
+        };
+        assert_eq!(
+            supported_option_args(&options),
+            ["-nosound", "-fps", "144", "-windowedfullscreen"]
+        );
+    }
+
+    #[test]
+    fn child_uses_frozen_launch_environment_not_inherited_values() {
+        const CHILD: &str = "GWNATIVE_SESSION_ENV_ISOLATION_CHILD";
+        if std::env::var(CHILD).as_deref() != Ok("1") {
+            let status = Command::new(std::env::current_exe().expect("test executable"))
+                .arg("launcher_sessions::tests::child_uses_frozen_launch_environment_not_inherited_values")
+                .arg("--exact")
+                .arg("--nocapture")
+                .env(CHILD, "1")
+                .env("GWNATIVE_ACCOUNT_AUTO_LOGIN", "inherited")
+                .env("GWNATIVE_TEXTURE_MANIFEST", "inherited")
+                .env("GWNATIVE_RESTORE_MAXIMIZED", "inherited")
+                .env("GWNATIVE_WINDOW_SNAPSHOT", "inherited")
+                .env("GWNATIVE_LAUNCH_OPTIONS", "inherited")
+                .status()
+                .expect("start isolated test child");
+            assert!(status.success(), "isolated environment child failed");
+            return;
+        }
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let stem = format!("gwnative-launcher-env-{}-{}", std::process::id(), nonce());
+        let script = std::env::temp_dir().join(format!("{stem}.sh"));
+        let output = std::env::temp_dir().join(format!("{stem}.sh.env"));
+        let script_body = "#!/bin/sh\nprintf '%s\\n' \"$GWNATIVE_ACCOUNT_AUTO_LOGIN\" \"$GWNATIVE_TEXTURE_MANIFEST\" \"$GWNATIVE_RESTORE_MAXIMIZED\" \"$GWNATIVE_WINDOW_SNAPSHOT\" \"$GWNATIVE_LAUNCH_OPTIONS\" > \"$0.env\"\n";
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o755)
+            .open(&script)
+            .expect("create environment fixture");
+        std::fs::write(&script, script_body.as_bytes()).expect("write environment fixture");
+
+        let mut spec = LaunchSpec::game(&script, "fixture");
+        spec.options.muted = true;
+        spec.env.extend([
+            ("GWNATIVE_ACCOUNT_AUTO_LOGIN".into(), "true".into()),
+            ("GWNATIVE_TEXTURE_MANIFEST".into(), "pinned".into()),
+            ("GWNATIVE_RESTORE_MAXIMIZED".into(), "1".into()),
+            ("GWNATIVE_WINDOW_SNAPSHOT".into(), "frozen-frame".into()),
+        ]);
+        let mut runner = CurrentExecutable::default();
+        let pid = runner.spawn(&spec).expect("spawn environment fixture");
+        for _ in 0..100 {
+            if runner.exited(pid).expect("observe environment fixture") == Some(true) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let values = std::fs::read_to_string(&output).expect("read captured environment");
+        let lines = values.lines().collect::<Vec<_>>();
+        assert_eq!(&lines[..4], ["true", "pinned", "1", "frozen-frame"]);
+        assert!(lines[4].contains("\"muted\":true"));
         let _ = std::fs::remove_file(script);
         let _ = std::fs::remove_file(output);
     }
@@ -1373,6 +1575,35 @@ mod tests {
             *controller.probe.commands.borrow(),
             vec![HostCommand::Show, HostCommand::Close]
         );
+    }
+
+    #[test]
+    fn capture_layout_is_only_sent_to_a_live_game() {
+        let mut controller = controller();
+        let request_id = "a".repeat(32);
+        assert!(
+            !controller
+                .capture_window_layout("missing", &request_id)
+                .unwrap()
+        );
+        let support = path("capture-layout");
+        assert!(controller.request("iron", support.clone()));
+        controller.tick();
+        assert!(
+            controller
+                .capture_window_layout("iron", &request_id)
+                .unwrap()
+        );
+        assert_eq!(
+            *controller.probe.commands.borrow(),
+            vec![HostCommand::CaptureWindowLayout { request_id }]
+        );
+    }
+
+    #[test]
+    fn capture_layout_rejects_an_unaddressable_request_id() {
+        let controller = controller();
+        assert!(controller.capture_window_layout("iron", "short").is_err());
     }
 
     #[test]
@@ -1585,6 +1816,29 @@ mod tests {
         assert!(controller.request("iron", support));
         controller.tick();
         assert_eq!(controller.runner.launches.len(), 2);
+    }
+
+    #[test]
+    fn failed_member_does_not_strand_later_queued_member() {
+        let mut controller = controller();
+        controller.runner.fail = true;
+        let first = path("failed-group-member");
+        let second = path("later-group-member");
+        assert!(controller.request("first", first));
+        assert!(controller.request("second", second));
+        controller.tick();
+        assert!(matches!(
+            controller
+                .snapshots()
+                .iter()
+                .find(|snapshot| snapshot.profile_id == "first")
+                .map(|snapshot| &snapshot.state),
+            Some(SessionState::Failed { .. })
+        ));
+        controller.runner.fail = false;
+        controller.tick();
+        assert_eq!(controller.runner.launches.len(), 2);
+        assert_eq!(controller.runner.launches[1].profile_id, "second");
     }
 
     #[test]

@@ -175,6 +175,55 @@ fn disable_features(preferences: &objc2_web_kit::WKPreferences, prefer_60_fps: b
 /// the page installs a passive observer from this exact preselected layout.
 /// A later round trip could pair a refreshed certificate with the already
 /// instantiated artifact, so the immutable launch snapshot is injected here.
+static TEXTURE_LEASE: std::sync::OnceLock<
+    std::sync::Mutex<Option<(crate::instance::Instance, std::path::PathBuf)>>,
+> = std::sync::OnceLock::new();
+
+extern "C" fn release_texture_session() {
+    let Some(slot) = TEXTURE_LEASE.get() else {
+        return;
+    };
+    let held = slot.lock().ok().and_then(|mut value| value.take());
+    if let Some((lease, path)) = held {
+        drop(lease);
+        // Launcher may still hold its lease; in that case its reaper finishes
+        // cleanup. If launcher already exited, this is the last owner.
+        let _ = crate::texture_packs::TextureLibrary::release_session(&path);
+    }
+}
+
+/// Process-lifetime shared lease also survives launcher exit/reconnect. Assets
+/// are read once and retained for any later WebView recreation in this game.
+fn pinned_texture_manifest() -> &'static serde_json::Value {
+    static MANIFEST: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    MANIFEST.get_or_init(|| {
+        let result = (|| {
+            let path = std::env::var("GWNATIVE_TEXTURE_MANIFEST")
+                .ok()
+                .filter(|p| !p.is_empty())
+                .ok_or_else(|| "no packs selected".to_owned())?;
+            let path = std::path::PathBuf::from(path);
+            let lease = crate::texture_packs::TextureLibrary::acquire_session_lease(&path)?;
+            let manifest = crate::texture_packs::TextureLibrary::load_session_manifest(&path)?;
+            let value = serde_json::to_value(manifest).map_err(|e| e.to_string())?;
+            TEXTURE_LEASE.get_or_init(|| std::sync::Mutex::new(Some((lease, path))));
+            // Normal game exit must release its manifest even after launcher
+            // quit. Crashes leave conservative orphan pins for later recovery.
+            if unsafe { libc::atexit(release_texture_session) } != 0 {
+                release_texture_session();
+                return Err("could not register texture-session cleanup".into());
+            }
+            Ok::<_, String>(value)
+        })();
+        result.unwrap_or_else(|error| {
+            if error != "no packs selected" {
+                note!("[textures] pack manifest bypassed: {error}");
+            }
+            serde_json::Value::Null
+        })
+    })
+}
+
 fn preamble(
     token: &str,
     game_publisher_token: &str,
@@ -187,6 +236,16 @@ fn preamble(
     let forced_runtime = std::env::var("GWNATIVE_CLIENT_RUNTIME")
         .ok()
         .filter(|value| value == "jspi" || value == "asyncify");
+    let launch_options = std::env::var("GWNATIVE_LAUNCH_OPTIONS")
+        .ok()
+        .and_then(|text| {
+            serde_json::from_str::<crate::launcher_preferences::ResolvedLaunchOptions>(&text).ok()
+        });
+    let preferred_character = launch_options
+        .as_ref()
+        .and_then(|options| options.preferred_character.as_deref())
+        .or(invocation.legacy.character.as_deref());
+    let texture_manifest = pinned_texture_manifest();
     format!(
         "window.__gwnativeToken = {};\nwindow.__gwnativeGamePublisherToken = {};\n\
          window.__gwnativeLaunchNonce = {};\n\
@@ -202,7 +261,10 @@ fn preamble(
          window.__gwnativePreserveDrawingBuffer = {};\nwindow.__gwnativeFrameIsolation = {};\n\
          window.__gwnativeLaunch = {};\n\
          window.__gwnativeManagedAccount = {};\n\
-         window.__gwnativeAutoLogin = {};",
+         window.__gwnativeAutoLogin = {};\n\
+         window.__gwnativePreferredCharacter = {};\n\
+         window.__gwnativeCharacterCapability = {};\n\
+         window.__gwnativeTextureManifest = {};",
         serde_json::Value::from(token),
         serde_json::Value::from(game_publisher_token),
         serde_json::Value::from(launch_nonce),
@@ -228,6 +290,13 @@ fn preamble(
         invocation.client_json(),
         crate::launcher::managed_game(),
         crate::launcher::managed_auto_login(),
+        serde_json::Value::from(preferred_character),
+        serde_json::to_string(&crate::character_bridge::Capability::unsupported(
+            "unselected",
+            "unverified"
+        ))
+        .expect("capability serializes"),
+        texture_manifest,
     )
 }
 

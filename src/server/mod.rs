@@ -91,6 +91,9 @@ fn tracing() -> bool {
 struct Context {
     /// Official client artifacts only; never a mutable browser shell.
     root: PathBuf,
+    /// Mutable, profile-local support directory. It is intentionally distinct
+    /// from `root`, which holds only official client artifacts.
+    profile_support_dir: PathBuf,
     /// One immutable, inventory-verified shell revision.
     shell_root: PathBuf,
     snapshot: Option<Arc<ChunkStore>>,
@@ -158,6 +161,7 @@ impl Drop for CapabilityTokens {
 
 pub struct Config {
     pub root: PathBuf,
+    pub profile_support_dir: PathBuf,
     pub shell_root: PathBuf,
     pub snapshot: Option<Arc<ChunkStore>>,
     pub recorder: Arc<Recorder>,
@@ -192,6 +196,12 @@ impl LaunchContract {
             transforms,
             admission: Mutex::new(LaunchAdmission::Fresh),
         }
+    }
+
+    /// Character observations are scoped to this one page launch. The nonce
+    /// itself is never persisted and the caller receives no diagnostic detail.
+    pub fn matches_session(&self, session_id: &str) -> bool {
+        crate::http::token_matches(&self.nonce, Some(session_id))
     }
 
     fn valid_claim(&self, claim: &generation::LaunchClaim) -> bool {
@@ -330,6 +340,7 @@ impl Drop for LaunchContract {
 pub fn spawn(config: Config) -> std::io::Result<Loopback> {
     let Config {
         root,
+        profile_support_dir,
         shell_root,
         snapshot,
         recorder,
@@ -350,6 +361,7 @@ pub fn spawn(config: Config) -> std::io::Result<Loopback> {
     let sockets = Arc::new(Registry::new(Arc::clone(&generations)));
     let context = Arc::new(Context {
         root,
+        profile_support_dir,
         shell_root,
         snapshot,
         sockets,
@@ -606,6 +618,7 @@ mod tests {
         let token = "test-token";
         let loopback = spawn(Config {
             root: dir.clone(),
+            profile_support_dir: dir.clone(),
             shell_root: dir.clone(),
             snapshot: None,
             recorder: Recorder::open(dir.join("diagnostics")),
@@ -764,6 +777,7 @@ mod tests {
         let publisher = "game-publisher-token";
         let loopback = spawn(Config {
             root: dir.clone(),
+            profile_support_dir: dir.clone(),
             shell_root: dir.clone(),
             snapshot: None,
             recorder: Recorder::open(dir.join("diagnostics")),
@@ -872,6 +886,89 @@ mod tests {
         );
     }
 
+    #[test]
+    fn character_observations_are_publisher_gated_session_bound_and_profile_local() {
+        let temp = TempDir::new("server-character-observations");
+        let dir = temp.0.clone();
+        let loopback = spawn(Config {
+            root: dir.join("official-artifacts"),
+            profile_support_dir: dir.join("profile-support"),
+            shell_root: dir.join("shell"),
+            snapshot: None,
+            recorder: Recorder::open(dir.join("diagnostics")),
+            derived_wasm: wasm::DerivedModules::default(),
+            settings: Arc::new(settings::ScopedStore::single(settings::Store::open(
+                dir.join("settings.json"),
+            ))),
+            generations: Arc::new(generation::Store::open(dir.join("generations"))),
+            tokens: capability_tokens("browser-token"),
+            launch: launch_contract(TEST_LAUNCH_NONCE),
+            port: PORT,
+            credential_account: "login".into(),
+        })
+        .unwrap();
+        let address = loopback.addr;
+        let body =
+            format!(r#"{{"sessionId":"{TEST_LAUNCH_NONCE}","names":["Devona","Cynn","Devona"]}}"#);
+
+        assert_eq!(
+            request(
+                address,
+                "POST",
+                "/__character-observations",
+                Some("browser-token"),
+                &body
+            )
+            .0,
+            403
+        );
+        assert_eq!(
+            request(
+                address,
+                "POST",
+                "/__character-observations",
+                Some("game-publisher-token"),
+                r#"{"sessionId":"stale","names":["Devona"]}"#
+            )
+            .0,
+            403
+        );
+        assert_eq!(
+            request(
+                address,
+                "POST",
+                "/__character-observations",
+                Some("game-publisher-token"),
+                &body
+            )
+            .0,
+            204
+        );
+        for protected in [TEST_LAUNCH_NONCE, "browser-token", "game-publisher-token"] {
+            let body = format!(r#"{{"sessionId":"{TEST_LAUNCH_NONCE}","names":["{protected}"]}}"#);
+            assert_eq!(
+                request(
+                    address,
+                    "POST",
+                    "/__character-observations",
+                    Some("game-publisher-token"),
+                    &body,
+                )
+                .0,
+                400,
+                "protected name accepted"
+            );
+        }
+        assert_eq!(
+            crate::character_bridge::load_observations(&dir.join("profile-support")),
+            ["Devona", "Cynn"]
+        );
+        assert!(
+            !dir.join("official-artifacts/character-observations.json")
+                .exists()
+        );
+    }
+
     /// The route the settings panel's "Clear Game Data…" reaches.
     ///
     /// What it does when there *is* a store is `cache::request_clear`, which has
@@ -886,6 +983,7 @@ mod tests {
         let token = "test-token";
         let loopback = spawn(Config {
             root: dir.clone(),
+            profile_support_dir: dir.clone(),
             shell_root: dir.clone(),
             // The interesting half of this test: no store, which is every launch
             // before the manifest is fetched and every launch that failed to get
@@ -940,6 +1038,7 @@ mod tests {
         let diagnostics = dir.join("diagnostics");
         let loopback = spawn(Config {
             root: dir.clone(),
+            profile_support_dir: dir.clone(),
             shell_root: dir.clone(),
             snapshot: None,
             recorder: Recorder::open(diagnostics.clone()),
@@ -1005,6 +1104,7 @@ mod tests {
         derived.insert(wasm::Runtime::Asyncify, transformed);
         let loopback = spawn(Config {
             root: dir.clone(),
+            profile_support_dir: dir.clone(),
             shell_root: shell,
             snapshot: None,
             recorder: Recorder::open(dir.join("diagnostics")),
@@ -1053,6 +1153,7 @@ mod tests {
         generations.record("test", &dir, &["Gw.jspi.js", "Gw.jspi.wasm"]);
         let loopback = spawn(Config {
             root: dir.clone(),
+            profile_support_dir: dir.clone(),
             shell_root: dir.clone(),
             snapshot: None,
             recorder: Recorder::open(dir.join("diagnostics")),
@@ -1219,6 +1320,7 @@ mod tests {
         assert!(generations.record("test", &dir, &names));
         let loopback = spawn(Config {
             root: dir.clone(),
+            profile_support_dir: dir.clone(),
             shell_root: dir.clone(),
             snapshot: None,
             recorder: Recorder::open(dir.join("diagnostics")),

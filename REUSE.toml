@@ -12,6 +12,9 @@ SPDX-License-Identifier = "GPL-3.0-only"
 path = [
   "src/companion-kernel/lib.rs",
   "src/wasm/rewrite.rs",
+  "src/wasm/character*.rs",
+  "src/texture_packs.rs",
+  "web/texture-packs.js",
   "web/companion-snapshot.js",
   "web/enhancement-cursor.js",
   "web/enhancement-readout.js",

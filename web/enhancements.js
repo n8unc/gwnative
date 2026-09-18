@@ -1,6 +1,6 @@
 // Installing optional enhancements as a passive, read-only observer.
 //
-// The host selected a signed certificate for the exact glue/module pair and
+// The host selected a signed or release-bundled certificate for the exact pair and
 // injected its layout under the selected runtime. The companion shares memory
 // but imports no game function and never enters the client's call graph.
 // Asyncify frames are observed only while its generated state machine reports
@@ -20,10 +20,12 @@ import {
   asyncifyStateReader,
   createPassiveObserver,
 } from './passive-observer.js';
-
-/** Must match `FEATURE_*` in `src/companion-kernel/lib.rs`. */
-const FEATURE_NATIVE_CURSOR = 1 << 0;
-const FEATURE_TARGET_READOUT = 1 << 1;
+import {
+  FEATURE_NATIVE_CURSOR,
+  FEATURE_TARGET_READOUT,
+  KNOWN_FEATURES,
+  selectEnhancementFeatures,
+} from './enhancement-capabilities.js';
 
 /** How many render-cost samples to keep for `window.gwCompanionRuntime`. */
 const SAMPLE_WINDOW = 240;
@@ -36,7 +38,7 @@ const COMPANION_STATE_BYTES = 168;
 const COMPANION_STACK_BYTES = 64 * 1024;
 
 /**
- * The signed manifest the native host selected, or `null` if it is not one this
+ * The reviewed manifest the native host selected, or `null` if it is not one this
  * page can act on.
  *
  * Everything is checked rather than read. This page and the host are versioned
@@ -56,6 +58,10 @@ function decodeManifest(candidate) {
       || value?.cursorSnapshotBytes !== COMPANION_CURSOR_BYTES
       || typeof value?.familyId !== 'string'
       || !/^[0-9a-f]{64}$/.test(value.familyId)
+      || (value?.featureMask !== undefined
+        && (!Number.isInteger(value.featureMask)
+          || value.featureMask <= 0
+          || value.featureMask > KNOWN_FEATURES))
       || !Array.isArray(value?.layoutWords)
       || value.layoutWords.length === 0
       || value.layoutWords.some(
@@ -72,6 +78,10 @@ function decodeManifest(candidate) {
     }
     return Object.freeze({
       ...value,
+      // Existing signed manifests predate per-feature certification and proved
+      // both tools together. Keep those manifests usable while requiring newer
+      // manifests to name the subset their exact client layout supports.
+      featureMask: value.featureMask === undefined ? KNOWN_FEATURES : value.featureMask,
       layoutWords: Object.freeze([...value.layoutWords]),
     });
   } catch {
@@ -96,6 +106,7 @@ function observeSnapshots(runtime, cursor, readout, observeState, observeGame) {
   let frame = 0;
   let cadenceAt = performance.now();
   let cadenceTick = 0;
+  let cursorActiveLogged = false;
   const observe = () => {
     if (!observeGame()) {
       runtime.observerSkips += 1;
@@ -134,6 +145,15 @@ function observeSnapshots(runtime, cursor, readout, observeState, observeGame) {
       readout?.update(state);
     }
     cursor?.poll();
+    if (
+      !cursorActiveLogged
+      && cursor?.state.valid === true
+      && cursor.state.hidden !== true
+      && cursor.state.cssLength > 4
+    ) {
+      cursorActiveLogged = true;
+      console.log('[enhancement] game cursor active');
+    }
     frame = requestAnimationFrame(observe);
   };
   frame = requestAnimationFrame(observe);
@@ -155,10 +175,7 @@ function observeSnapshots(runtime, cursor, readout, observeState, observeGame) {
  *           runtime: 'jspi' | 'asyncify' }} selection
  */
 export async function installEnhancements(instance, manifestValue, selection) {
-  const featureFlags =
-    (selection.nativeCursor ? FEATURE_NATIVE_CURSOR : 0)
-    | (selection.targetReadout ? FEATURE_TARGET_READOUT : 0);
-  if (featureFlags === 0) return null;
+  if (!selection.nativeCursor && !selection.targetReadout) return null;
 
   const manifest = decodeManifest(manifestValue);
   const exports = instance?.exports;
@@ -181,6 +198,21 @@ export async function installEnhancements(instance, manifestValue, selection) {
     // diagnostics overlay and the log file rather than a terminal nobody has.
     console.warn(`[enhancement] this client cannot be driven: ${missing}`);
     window.gwCompanionState = Object.freeze({ status: 'unsupported', reason: missing });
+    return null;
+  }
+  const features = selectEnhancementFeatures(manifest, selection);
+  if (features.unavailable !== 0) {
+    const names = [
+      ...(features.unavailable & FEATURE_NATIVE_CURSOR ? ['native cursor'] : []),
+      ...(features.unavailable & FEATURE_TARGET_READOUT ? ['target readout'] : []),
+    ];
+    console.warn(`[enhancement] ${names.join(' and ')} is not certified for this client`);
+  }
+  if (features.flags === 0) {
+    window.gwCompanionState = Object.freeze({
+      status: 'unsupported',
+      reason: 'the selected enhancements are not certified for this client',
+    });
     return null;
   }
 
@@ -219,11 +251,11 @@ export async function installEnhancements(instance, manifestValue, selection) {
     // The client's own allocator, so these are inside the memory the companion
     // is about to be instantiated over. Nothing the page allocates for itself
     // would be visible from there at all.
-    if (selection.targetReadout) {
+    if (features.targetReadout) {
       snapshotPointer = Number(exports.malloc(COMPANION_SNAPSHOT_BYTES));
     }
     configPointer = Number(exports.malloc(manifest.configBytes));
-    if (selection.nativeCursor) {
+    if (features.nativeCursor) {
       cursorPointer = Number(exports.malloc(COMPANION_CURSOR_BYTES));
     }
     statePointer = Number(exports.malloc(COMPANION_STATE_BYTES));
@@ -234,8 +266,8 @@ export async function installEnhancements(instance, manifestValue, selection) {
       !configPointer
       || !statePointer
       || !stackAllocationPointer
-      || (selection.targetReadout && !snapshotPointer)
-      || (selection.nativeCursor && !cursorPointer)
+      || (features.targetReadout && !snapshotPointer)
+      || (features.nativeCursor && !cursorPointer)
     ) {
       throw new Error('the client would not allocate the companion regions');
     }
@@ -288,19 +320,19 @@ export async function installEnhancements(instance, manifestValue, selection) {
       statePointer,
       COMPANION_STATE_BYTES,
       snapshotPointer,
-      selection.targetReadout ? COMPANION_SNAPSHOT_BYTES : 0,
+      features.targetReadout ? COMPANION_SNAPSHOT_BYTES : 0,
       configPointer,
       manifest.configBytes,
       cursorPointer,
-      selection.nativeCursor ? COMPANION_CURSOR_BYTES : 0,
-      featureFlags,
+      features.nativeCursor ? COMPANION_CURSOR_BYTES : 0,
+      features.flags,
     );
     if (initStatus !== 1) {
       throw new Error(`the companion module refused its ABI (status ${initStatus})`);
     }
 
     let cursor = null;
-    if (selection.nativeCursor) {
+    if (features.nativeCursor) {
       const element = document.getElementById('canvas');
       if (!element) throw new Error('there is no canvas to take the cursor of');
       cursor = createCursorConsumer({
@@ -312,7 +344,7 @@ export async function installEnhancements(instance, manifestValue, selection) {
       });
       disposeCursor = cursor.dispose;
     }
-    const readout = selection.targetReadout ? createTargetReadout(document.body) : null;
+    const readout = features.targetReadout ? createTargetReadout(document.body) : null;
     if (readout) disposeReadout = readout.dispose;
 
     const runtime = {
@@ -365,7 +397,7 @@ export async function installEnhancements(instance, manifestValue, selection) {
       runtime,
       cursor,
       readout,
-      selection.targetReadout,
+      features.targetReadout,
       observeGame,
     );
 

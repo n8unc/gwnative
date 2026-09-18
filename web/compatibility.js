@@ -48,9 +48,10 @@ export function templateSaveNotice(state) {
  * runtime fixtures have proved its memory layout.
  *
  * @param {unknown} state `window.__gwnativeEnhancements`
+ * @param {unknown} featureMask selected manifest's reviewed capability mask
  * @returns {string | null}
  */
-export function enhancementNotice(state) {
+export function enhancementNotice(state, featureMask) {
   if (state === 'uncertified') {
     return (
       'The native cursor and target-distance tools are disabled for this client ' +
@@ -62,6 +63,12 @@ export function enhancementNotice(state) {
     return (
       'The native cursor and target-distance tools are disabled because preparing ' +
       'their certified observer did not finish. The Diagnostics window says what failed.'
+    );
+  }
+  if (state === 'ready' && featureMask === 1) {
+    return (
+      'The native cursor is available for this client build. The target-distance ' +
+      'tool is unavailable because its read-only layout has not been certified.'
     );
   }
   return null;

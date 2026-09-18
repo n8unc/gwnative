@@ -215,6 +215,12 @@ an allowlisted ArenaNet/Guild Wars DNS answer recorded by this process. Only
 the conjunction of those independently observed milestones promotes the
 generation.
 
+The web runtime lifecycle module (`web/client-runtime.js`) owns attempt identity,
+proof ordering, transform fallback, first-frame sealing, and runtime-failure
+transition policy. The harness supplies generated-client and streaming adapters,
+DOM presentation, and flush reporting through its four-operation interface;
+callbacks are notifications and do not make lifecycle decisions.
+
 ## Game-image storage
 
 The 4.2 GB snapshot is represented by roughly 16,000 content-addressed 256 KiB
@@ -357,6 +363,7 @@ suspension model and reproduction matrix.
 | Credentials and settings | `src/keychain.rs`, `src/settings.rs`, `src/paths.rs` |
 | WebAssembly transforms | `src/wasm/`, `src/companion-kernel/lib.rs`, `build.rs` |
 | Diagnostics | `src/diagnostics.rs`, `src/report.rs`, `web/diagnostics.js`, `web/memory.js` |
+| Web runtime lifecycle | `web/client-runtime.js` |
 | Web harness | `web/harness.js`, `web/graphics.js`, `web/audio.js`, `web/filesystem.js`, `web/input.js` |
 | Player UI | `web/launcher.js`, `web/settings-panel.js`, `web/guide.js`, `web/loading.js` |
 | Packaging and release | `packaging/`, `scripts/bundle`, `scripts/release`, `scripts/publish`, `scripts/appcast` |

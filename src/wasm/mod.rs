@@ -12,9 +12,14 @@
 //! is not in an Asyncify unwind/rewind. That makes the layout certificate
 //! reusable across the two runtimes without claiming their control flow is the
 //! same.
+//!
+//! A release-reviewed cursor-only layout can also authorize passive cursor
+//! observation without template support. It is pinned to exact official
+//! Wasm/glue pairs and cannot enable the target readout; see `cursor`.
 
 mod certificate;
 mod codec;
+mod cursor;
 mod rewrite;
 
 use std::collections::BTreeMap;
@@ -302,16 +307,28 @@ fn prepare_runtime(
     enhance: bool,
     generations: &generation::Store,
 ) -> (Option<PathBuf>, RuntimeModule) {
-    match prepare_runtime_inner(root, cache_root, feed, runtime, enhance, generations) {
-        Ok(result) => result,
-        Err(reason) => {
-            note!("[gwnative] {}: {reason}", runtime.key());
-            (
-                None,
-                RuntimeModule::unavailable(None, enhancements::FAILED, enhance),
-            )
-        }
+    let (path, mut module) =
+        match prepare_runtime_inner(root, cache_root, feed, runtime, enhance, generations) {
+            Ok(result) => result,
+            Err(reason) => {
+                note!("[gwnative] {}: {reason}", runtime.key());
+                (
+                    None,
+                    RuntimeModule::unavailable(None, enhancements::FAILED, enhance),
+                )
+            }
+        };
+    // Cursor observation does not call or rewrite template functions. A
+    // separately reviewed exact artifact pair can keep its cursor when the
+    // template certificate is absent or its transform has failed.
+    if enhance
+        && module.enhancements != enhancements::READY
+        && let Some(manifest) = cursor::manifest(root, runtime)
+    {
+        module.enhancements = enhancements::READY;
+        module.enhancement_manifest = Some(manifest);
     }
+    (path, module)
 }
 
 fn prepare_runtime_inner(
@@ -706,6 +723,84 @@ mod tests {
         assert_eq!(module.build.as_deref(), Some(compatibility_id.as_str()));
         assert_eq!(module.template_save, "failed");
         assert_eq!(module.enhancements, enhancements::FAILED);
+    }
+
+    #[test]
+    fn external_cursor_pair_is_ready_without_template_support() {
+        let Ok(root) = std::env::var("GWNATIVE_CURSOR_TEST_ROOT") else {
+            return;
+        };
+        let feed = certificate::bundled().unwrap();
+        let temporary = crate::scratch::TempDir::new("cursor-runtime-prepare");
+        let generations = generation::Store::open(temporary.0.join("generations"));
+        for runtime in Runtime::ALL {
+            let (derived, module) = prepare_runtime(
+                Path::new(&root),
+                &temporary.0.join("derived"),
+                &feed,
+                runtime,
+                true,
+                &generations,
+            );
+            assert_eq!(
+                module.enhancements,
+                enhancements::READY,
+                "{} cursor",
+                runtime.key()
+            );
+            assert!(
+                derived.is_none(),
+                "cursor observation must not rewrite game code"
+            );
+            assert_eq!(module.template_save, enhancements::UNCERTIFIED);
+            assert_eq!(module.enhancement_manifest.unwrap()["featureMask"], 1);
+
+            let (_, disabled) = prepare_runtime(
+                Path::new(&root),
+                &temporary.0.join("derived"),
+                &feed,
+                runtime,
+                false,
+                &generations,
+            );
+            assert_eq!(disabled.enhancements, enhancements::OFF);
+            assert!(disabled.enhancement_manifest.is_none());
+
+            // A remembered template failure must not disable the independent
+            // read-only cursor. This exercises the real quarantine branch.
+            let mut quarantined_feed = feed.clone();
+            let certificate = quarantined_feed.families[0]
+                .runtimes
+                .iter_mut()
+                .find(|entry| entry.runtime == runtime)
+                .unwrap();
+            certificate.wasm_sha256 =
+                digest(&fs::read(Path::new(&root).join(runtime.wasm_name())).unwrap());
+            certificate.glue_sha256 =
+                digest(&fs::read(Path::new(&root).join(runtime.glue_name())).unwrap());
+            let identity = runtime_compatibility_id(
+                runtime,
+                &certificate.wasm_sha256,
+                &certificate.glue_sha256,
+                certificate::TRANSFORM_ABI,
+                Some(&certificate.template.output_sha256),
+            );
+            generations
+                .disable_transform(runtime.key(), &identity)
+                .unwrap();
+            let (derived, quarantined) = prepare_runtime(
+                Path::new(&root),
+                &temporary.0.join("derived"),
+                &quarantined_feed,
+                runtime,
+                true,
+                &generations,
+            );
+            assert!(derived.is_none());
+            assert_eq!(quarantined.template_save, enhancements::FAILED);
+            assert_eq!(quarantined.enhancements, enhancements::READY);
+            assert_eq!(quarantined.enhancement_manifest.unwrap()["featureMask"], 1);
+        }
     }
 
     #[test]

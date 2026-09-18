@@ -133,8 +133,6 @@ const scrubDiagnostic = (value) => {
 };
 let client;
 let frameAudit = null;
-let firstFramePresented = false;
-let runtimeTransition = null;
 let bootProof = Promise.resolve(true);
 window.gwFlushBootProof = async () => {
   const booted = await bootProof;
@@ -533,6 +531,7 @@ let renderScale = 1;
 let host;
 let diag;
 let recovery;
+let runtimeLifecycle;
 // The client's own allocator, reached through the instance rather than through
 // `Module.wasmExports`: this build's glue does not export that name, and asking
 // for it does not return undefined — it aborts.
@@ -554,7 +553,15 @@ Module = {
       preserveDrawingBuffer: window.__gwnativePreserveDrawingBuffer === true,
       frameIsolation: window.__gwnativeFrameIsolation === true,
       firstFrame: () => {
-        firstFramePresented = true;
+        // Capture acknowledgement before presentation side effects can throw;
+        // lifecycle seals startup fallback synchronously at this call.
+        bootProof = runtimeLifecycle.firstFrame().then(
+          () => true,
+          (error) => {
+            log('[warn] first-frame proof was not acknowledged:', error);
+            return false;
+          },
+        );
         performance.mark('gw.frame.first-submit');
         // The boot is survived; frame delivery goes back to stock. See the
         // requestAnimationFrame wrapper above.
@@ -571,18 +578,6 @@ Module = {
         // Time to first frame, from the page's own origin rather than from
         // process start — the one launch number a change can be judged by.
         diag?.gauge('gw.boot.first-frame.ms', performance.now());
-        // Everything the chunk store served up to here is what booting costs.
-        // Telling the host now, rather than at some later milestone, is what
-        // keeps the recorded list to the chunks that gate the first frame.
-        bootProof = host.deliverRuntimeProof('__booted', {
-          launch: window.__gwnativeLaunchIdentity,
-        }).then(
-          () => true,
-          (error) => {
-            log('[warn] first-frame proof was not acknowledged:', error);
-            return false;
-          },
-        );
       },
       log,
     });
@@ -609,7 +604,6 @@ Module = {
       log,
     });
 
-    const url = client.wasm;
     performance.mark('gw.wasm.instantiate.begin');
     (async () => {
       const instantiate = async (source) => {
@@ -623,27 +617,7 @@ Module = {
           );
         }
       };
-      let result;
-      try {
-        result = await instantiate(url);
-      } catch (error) {
-        if (
-          window.__gwnativeTemplateSave !== 'ready'
-          || typeof window.__gwnativeClientBuild !== 'string'
-        ) {
-          throw error;
-        }
-        log(
-          '[warn] certified client could not instantiate; retrying ArenaNet’s exact module:',
-          error,
-        );
-        await reportTransformFailure();
-        window.__gwnativeTemplateSave = 'failed';
-        window.__gwnativeEnhancements = 'off';
-        window.__gwnativeEnhancementManifest = null;
-        window.__gwnativeLaunchIdentity = await reportRuntimeAttempt();
-        result = await instantiate(`${url}?gwnative-original=1`);
-      }
+      const result = await runtimeLifecycle.instantiate(instantiate);
       performance.mark('gw.wasm.instantiate.end');
       // 8.2 MB to fetch and compile, and the largest single item in a launch.
       // Worth its own gauge: it is what a code cache would move, so a claim
@@ -816,7 +790,7 @@ Module = {
  * Install optional enhancements, if this launch is one that has them.
  *
  * Three things have to line up: the player turned a tool on, the host selected
- * an exact signed runtime certificate, and that certificate carries the
+ * an exact signed or release-bundled certificate, and that certificate carries the
  * passive-observer layout for the same artifact.
  *
  * `enhancements.js` and everything under it is imported here rather than in
@@ -838,7 +812,7 @@ function installTools() {
     !gameInstance
     || !window.__gwnativeEnhancementManifest
   ) {
-    log('[warn] enhancements: the selected runtime carries no signed manifest');
+    log('[warn] enhancements: the selected runtime carries no reviewed manifest');
     return;
   }
   const instance = gameInstance;
@@ -857,41 +831,10 @@ function appendGlue() {
   document.body.appendChild(script);
 }
 
-function reportRuntimeAttempt() {
-  const transformed = window.__gwnativeTemplateSave === 'ready';
-  const launch = {
-    runtime: client.mode,
-    build: transformed ? window.__gwnativeClientBuild : null,
-    transformed,
-    nonce: window.__gwnativeLaunchNonce,
-  };
-  return host.deliverRuntimeProof('__runtime', launch).then(() => launch);
-}
-
-function reportTransformFailure() {
-  return host.deliverRuntimeProof('__transform-failed', {
-    launch: window.__gwnativeLaunchIdentity,
-  });
-}
-
 function runtimeFailedBeforeProof(reason) {
   const message = reason?.message ?? String(reason);
-  if (firstFramePresented || !window.__gwnativeLaunchIdentity) {
-    fail(`The game client stopped unexpectedly: ${message}`);
-    return;
-  }
-  if (runtimeTransition) return;
-  status('Trying the other official runtime…');
-  const launch = window.__gwnativeLaunchIdentity;
-  runtimeTransition = (async () => {
-    if (launch.transformed === true) {
-      await reportTransformFailure();
-      await host.relaunchApp();
-      return;
-    }
-    await host.transitionRuntimeFailure(launch, { relaunch: host.relaunchApp });
-  })().catch((error) => {
-    fail(`The game client could not start: ${error?.message ?? error}`);
+  runtimeLifecycle.fail(message).catch((error) => {
+    fail(error?.message ?? String(error));
   });
 }
 
@@ -1019,6 +962,16 @@ function runtimeFailedBeforeProof(reason) {
     log('frame audit: detailed callback/draw correlation enabled');
   }
   host.applyClientLimits(client, host.currentSettings(), window);
+  runtimeLifecycle = host.createRuntimeLifecycle({
+    client,
+    target: window,
+    relaunch: host.relaunchApp,
+    onTransition: () => status('Trying the other official runtime…'),
+    onOriginalFallback: (error) => log(
+      '[warn] certified client could not instantiate; retrying ArenaNet’s exact module:',
+      error,
+    ),
+  });
   log(
     `client runtime: ${client.mode}`,
     client.mode === 'jspi'
@@ -1265,16 +1218,9 @@ function runtimeFailedBeforeProof(reason) {
   });
 
   status('Starting the game…');
-  try {
-    // Only now has the launch actually attempted a client. A player who closes
-    // the app before this point must not make the next launch reject or roll
-    // back a generation it never ran.
-    window.__gwnativeLaunchIdentity = await reportRuntimeAttempt();
-  } catch (error) {
+  runtimeLifecycle.start(appendGlue).catch((error) => {
     fail(`The runtime launch could not be recorded: ${error?.message ?? error}`);
-    return;
-  }
-  appendGlue();
+  });
 })();
 
 })();

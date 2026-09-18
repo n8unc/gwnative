@@ -419,7 +419,10 @@ export function installSettingsPanel({
   if (notice) {
     const sentences = [
       templateSaveNotice(globalThis.__gwnativeTemplateSave),
-      enhancementNotice(globalThis.__gwnativeEnhancements),
+      enhancementNotice(
+        globalThis.__gwnativeEnhancements,
+        globalThis.__gwnativeEnhancementManifest?.featureMask,
+      ),
     ].filter((sentence) => sentence !== null);
     notice.textContent = sentences.join(' ');
     notice.hidden = sentences.length === 0;

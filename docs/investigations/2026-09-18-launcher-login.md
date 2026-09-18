@@ -200,3 +200,47 @@ Saved credential delivery and startup option parsing are proven independently.
 Automatic login, authentication outcome, challenge handling, character
 selection, and world entry remain unproven; no implementation should claim them
 from these offline results.
+
+## Subsequent live auto-login verification
+
+The earlier result above describes the original investigation. A controlled
+2026-09-18 comparison now establishes automatic submission on the reviewed JSPI
+artifact, using the user's authorized Main Account:
+
+- Baseline: saved credentials delivered through the existing host bridge; game
+  remained at the prefilled login screen.
+- Flag-only variant: `Module.arguments = ['-autologin']`; same profile and
+  credential route; game reached character selection without mouse or keyboard
+  submission. The user independently confirmed the result.
+- No email/password arguments, DOM field filling, timed Enter, character choice,
+  or world-entry action was used.
+- Final rebuilt integration, with the saved Auto-login preference enabled and
+  conditional flag insertion, independently reached character selection again.
+  Validation: 405 Rust tests passed (three ignored), the complete web-suite
+  integration passed, and formatting, Clippy and diff checks passed.
+
+Production integration captures the Account's Auto-login choice when the game
+registers its profile and injects only a boolean into the private WebView
+preamble. `Module.arguments` starts empty. After the exact-pair credential bridge
+successfully prepares saved credentials, the harness appends `-autologin` if
+that boolean is true, before calling the WASM success callback. Both official
+glue files capture the arguments array before asynchronous instantiation and
+consume it after that callback; replacing the array would lose the flag.
+
+The harness regression executes this actual boundary for both glue variants,
+including delayed delivery, opt-out, unmanaged profiles, absent/failed credential
+reads, and missing reviewed exports. It checks the captured array at the success
+callback, including that no credential strings enter it. Existing prefill probes
+continue to check the real client functions for both artifacts.
+
+GWOnMac reference commit `004194ff318320f854240fd227462b19889bef24` takes a different
+route: [automatic-character-return.ts](https://github.com/Mat4m0/gwonmac/blob/004194ff318320f854240fd227462b19889bef24/src/renderer/automatic-character-return.ts)
+claims an armed relog intent, waits for rendering and pre-game controls, then
+[input.ts](https://github.com/Mat4m0/gwonmac/blob/004194ff318320f854240fd227462b19889bef24/src/renderer/input.ts)
+sends canvas Enter. Its renderer does not set login arguments. GWNative uses the
+client's existing auto-login flow instead of copying that input automation.
+
+This proves successful sign-in on the tested JSPI client. It does not prove
+wrong-password/security-challenge behavior, Asyncify live sign-in, or a launcher
+authentication-result/Needs attention signal. The host adds no retry loop; the
+client retains control of authentication errors and challenges.

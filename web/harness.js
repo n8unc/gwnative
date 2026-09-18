@@ -538,6 +538,9 @@ let runtimeLifecycle;
 let gameInstance;
 
 Module = {
+  // Glue retains this array before asynchronous instantiation. Only the
+  // non-secret submit flag is added, once saved credentials are ready.
+  arguments: [],
   canvas: document.getElementById('canvas'),
   print: (text) => log(text),
   printErr: (text) => log('[err]', text),
@@ -637,13 +640,18 @@ Module = {
       gameInstance = result.instance;
       // Before the glue resumes constructors/main: the client builds its login
       // UI only once. Keychain values stay on secureStorage; this enables only
-      // the certified per-instance request gate, never automatic submission.
-      await host.prepareLauncherCredentials({
+      // the certified per-instance request gate. The client's own auto-login
+      // flow then waits for credential delivery and stops at character select.
+      const credentialsReady = await host.prepareLauncherCredentials({
         managed: window.__gwnativeManagedAccount === true,
         readSaved,
         exports: gameInstance.exports,
         log,
       });
+      if (credentialsReady && window.__gwnativeAutoLogin === true) {
+        // Mutate rather than replace: generated glue already holds this array.
+        Module.arguments.push('-autologin');
+      }
       success(result.instance, result.module);
     })().catch(runtimeFailedBeforeProof);
 

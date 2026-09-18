@@ -20,19 +20,19 @@ removed from that target to make the implementation appear complete.
   review, and removal flows are wired to native operations.
 - Game-client revalidation offers pending generations without replacing active
   game files. Application release checks currently fetch metadata only.
+- Auto-login uses the client's `-autologin` flag with saved credentials delivered
+  through Keychain. The flag is enabled only for an opted-in managed Account
+  after the reviewed credential bridge is ready; passwords never enter argv.
 
 ## Unresolved acceptance gates
 
-**Automatic login is not implemented.** The saved-credential bridge can provide
-credentials, but a reliable submit action and authentication/challenge state have
-not been certified. An offline test now proves that the actual WASM option parser
-accepts `--email=value`, `--password=value`, and `--autologin`. It also exposes
-password encoding/quoting failures in that argv path. The next controlled live
-test should pass only `--autologin` and retain the existing protected credential
-bridge; its interaction with that flag is not yet proven. Accounts can launch regardless of their saved Auto-login choice. This build
-prefills saved credentials and requires the user to click Log In in game; the
-Auto-login control is unavailable until automatic submission is implemented. The diagnostic probe is not connected to a game and does not submit
-or infer authentication success. See [login investigation](investigations/2026-09-18-launcher-login.md).
+**Login failure/challenge reporting still needs live acceptance.** A controlled
+JSPI launch of Main reached character selection with `-autologin` and no manual
+submission; the same launch without the flag stayed at the prefilled login form.
+The user confirmed the successful result. The host schedules no keyboard input
+or retry loop. Wrong-password and security-challenge handling, plus launcher
+Needs attention reporting, are not established by that successful login. See
+[login investigation](investigations/2026-09-18-launcher-login.md).
 
 **Application update download/install is not implemented.** Sparkle can install
 when its host terminates, including while independent game processes survive.
@@ -89,6 +89,9 @@ because the client only accepts a returned password for a matching visible name.
 The existing secure-storage callback delivers email and password; no credential
 arguments are generated. In-game save/clear calls preserve launcher ownership.
 
-This is prefill only. Play and Auto-launch accept accounts with saved Auto-login
-choices; automatic submission remains unavailable.
-Unknown client versions and unavailable credentials retain manual login.
+Auto-login adds `-autologin` to the existing in-memory `Module.arguments` array
+after this preparation succeeds and before the WASM success callback resumes
+client startup. Both generated glue files already retain this array, so it must
+be mutated rather than replaced. Auto-login off keeps prefill with manual
+submission. Unknown client versions and unavailable credentials retain manual
+login. No character-selection or world-entry input is generated.

@@ -38,9 +38,19 @@ use crate::{app, cli, dock, instance, paths, profile};
 type Sessions = SessionController<CurrentExecutable, IpcProbe>;
 thread_local! { static STATE: RefCell<Option<State>> = const { RefCell::new(None) }; }
 static MANAGED_GAME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static MANAGED_AUTO_LOGIN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 pub fn managed_game() -> bool {
     MANAGED_GAME.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Auto-login choice captured with Account selected for this game process.
+///
+/// WebView preamble must not reread mutable launcher metadata after startup:
+/// that could pair later Account edit with already selected profile.
+pub fn managed_auto_login() -> bool {
+    MANAGED_AUTO_LOGIN.load(std::sync::atomic::Ordering::Acquire)
 }
 
 pub fn game_account(profile_id: &str) -> Result<Option<Account>, String> {
@@ -53,6 +63,12 @@ pub fn game_account(profile_id: &str) -> Result<Option<Account>, String> {
 pub fn register_game(profile_id: &str) -> Result<Option<Account>, String> {
     let account = game_account(profile_id)?;
     MANAGED_GAME.store(account.is_some(), std::sync::atomic::Ordering::Release);
+    MANAGED_AUTO_LOGIN.store(
+        account
+            .as_ref()
+            .is_some_and(|account| account.auto_login && account.has_password),
+        std::sync::atomic::Ordering::Release,
+    );
     Ok(account)
 }
 
@@ -182,11 +198,7 @@ impl State {
                         .is_some_and(|t| t.elapsed() > Duration::from_secs(5));
                 let mut value = serde_json::to_value(&a).expect("Account metadata serializes");
                 value["status"] = json!(status);
-                value["statusLabel"] = json!(if status == "ready" && a.auto_login {
-                    "Ready — click Log In in game".to_owned()
-                } else {
-                    label
-                });
+                value["statusLabel"] = json!(label);
                 value["busy"] = json!(held);
                 value["canShow"] = json!(show);
                 value["canClose"] = json!(close);

@@ -2,7 +2,7 @@
 (() => {
   const busyStates = new Set(['queued', 'preparing', 'starting', 'running', 'closing', 'recovering', 'attention', 'unavailable']);
   const model = {
-    autoLoginSupported: false,
+    autoLoginSupported: true,
     busy: (account) => Boolean(account.busy || busyStates.has(account.status)),
     canPlay: (account) => !model.busy(account),
     selectedLaunches: (accounts, selected) => accounts.filter((a) => selected.has(a.id) && model.canPlay(a)).map((a) => a.id),
@@ -152,12 +152,14 @@
   }
   $('account-form').onsubmit = async (event) => {
     event.preventDefault(); if (saving) return;
-    const values = { accountId: editing?.id, profileId: adopting?.profileId, nickname: $('nickname').value.trim(), email: $('email').value.trim(), autoLogin: model.savedAutoLogin({ editing, adopting, removed: $('remove-password').checked }), autoLaunch: $('auto-launch').checked, removePassword: $('remove-password').checked };
     const originalEmail = editing?.email || adopting?.email;
-    const emailChanged = originalEmail && values.email.toLowerCase() !== originalEmail.toLowerCase();
+    const email = $('email').value.trim();
+    const removePassword = $('remove-password').checked;
+    const emailChanged = originalEmail && email.toLowerCase() !== originalEmail.toLowerCase();
+    const values = { accountId: editing?.id, profileId: adopting?.profileId, nickname: $('nickname').value.trim(), email, autoLogin: !removePassword && !emailChanged && $('auto-login').checked, autoLaunch: $('auto-launch').checked, removePassword };
     if (emailChanged) {
       if (!await confirm('Change this login?', 'This Account keeps its existing private files. Its old password will be cleared and Auto-login turned off. For a separate game account, use Add Account.')) return;
-      values.preserveContext = true; values.autoLogin = false;
+      values.preserveContext = true;
     }
     if (!editing && !adopting) {
       const retained = snapshot.retained?.find((a) => a.email.toLowerCase() === values.email.toLowerCase());

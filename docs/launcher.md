@@ -1,8 +1,8 @@
 # Launcher MVP specification
 
 Status: shared understanding confirmed; implementation authorized.
-Development implementation underway. Auto-login and application-update installation
-remain unresolved acceptance gates; this is not a completed MVP. Required evidence
+Development implementation underway. Auto-login failure/challenge acceptance and
+application-update installation remain unresolved; this is not a completed MVP. Required evidence
 below remains distinct from [implementation results](launcher-implementation.md).
 
 ## Accepted scope

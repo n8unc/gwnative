@@ -146,7 +146,7 @@ describe('launcher credential capability', () => {
     const pending = new Promise((resolve) => { release = resolve; });
     let success;
     const sandbox = {
-      Module: { canvas: {} },
+      Module: { canvas: {}, arguments: [] },
       window: { __gwnativeManagedAccount: true },
       performance: {
         mark() {},
@@ -183,6 +183,64 @@ describe('launcher credential capability', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     assert.deepEqual(events, [0, 1, 'success']);
     assert.ok(success);
+  });
+
+  it('arms only opted-in managed login after credentials are ready, before client main', async () => {
+    const source = readFileSync(new URL('./harness.js', import.meta.url), 'utf8');
+    const start = source.indexOf('instantiateWasm(imports, success) {');
+    const end = source.indexOf('\n  // Both generated glue files', start);
+    const method = source.slice(start, end).replace(/,\s*$/, '');
+    for (const runtime of ['Gw.js', 'Gw.jspi.js']) {
+      const glue = readFileSync(new URL(runtime, import.meta.url), 'utf8');
+      const capture = glue.match(/if \(Module\['arguments'\]\) arguments_ = Module\['arguments'\];/)[0];
+      for (const scenario of [
+        { managed: true, autoLogin: true, saved: true, certified: true, expected: ['-autologin'] },
+        { managed: true, autoLogin: false, saved: true, certified: true, expected: [] },
+        { managed: false, autoLogin: true, saved: true, certified: true, expected: [] },
+        { managed: true, autoLogin: true, saved: false, certified: true, expected: [] },
+        { managed: true, autoLogin: true, saved: true, certified: false, expected: [] },
+        { managed: true, autoLogin: true, saved: true, certified: true, readFails: true, expected: [] },
+      ]) {
+        let release;
+        const pending = new Promise((resolve) => { release = resolve; });
+        let succeeded = false;
+        let mainArguments;
+        let failure;
+        const sandbox = {
+          Module: { canvas: {}, arguments: vm.runInNewContext(source.match(/^  arguments: (.+),$/m)[1]) },
+          window: { __gwnativeManagedAccount: scenario.managed, __gwnativeAutoLogin: scenario.autoLogin },
+          performance: { mark() {}, measure() { return { duration: 0 }; } },
+          host: { installGameAudioResumeLifecycle() {}, installGraphics() {},
+            installMemorySensor() {}, installTemplateSave() {}, prepareLauncherCredentials },
+          runtimeLifecycle: { instantiate: async () => ({ instance: {
+            exports: scenario.certified ? fakeExports(() => {}) : {},
+          }, module: {} }) },
+          readSaved: async () => {
+            if (scenario.readFails) throw new Error('unavailable');
+            return pending;
+          },
+          frameAudit: {}, log() {}, status() {}, releaseStage() {},
+          runtimeFailedBeforeProof(error) { failure = error; },
+          diag: null, readHeap: null, bootProof: null, bootRescueActive: true,
+          document: {}, fetch: async () => { throw new Error('network disabled'); }, WebAssembly,
+        };
+        const context = vm.createContext(sandbox);
+        // Generated glue captures this array before asynchronous instantiation.
+        vm.runInContext(`var arguments_ = []; ${capture}`, context);
+        const captured = context.arguments_;
+        const instantiate = vm.runInContext(`({${method}}).instantiateWasm`, context);
+        instantiate({}, () => { succeeded = true; mainArguments = Array.from(captured); });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.deepEqual(Array.from(captured), [], 'No submit flag before credential read finishes');
+        release(scenario.saved ? { username: 'dummy with spaces', password: 'dummy 🔒 password' } : null);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(failure, undefined);
+        assert.equal(succeeded, true);
+        assert.equal(sandbox.Module.arguments, captured, 'Must preserve array already captured by glue');
+        assert.deepEqual(mainArguments, scenario.expected, 'Flag must exist before success resumes main');
+        assert.deepEqual(Array.from(captured), scenario.expected, `${runtime}: ${JSON.stringify(scenario)}`);
+      }
+    }
   });
 
   it('executes managed secureStorage store and clear without host writes', async () => {

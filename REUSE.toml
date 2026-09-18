@@ -58,6 +58,7 @@ path = [
   "docs/assets/game-login.jpg",
   "packaging/AppIcon.icns",
   "packaging/icon.png",
+  "web/fixtures/*.txt",
 ]
 precedence = "override"
 SPDX-FileCopyrightText = "ArenaNet LLC"

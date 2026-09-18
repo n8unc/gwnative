@@ -71,8 +71,11 @@ That complete notice is copied into every application bundle as
 ## ArenaNet and Guild Wars material
 
 ArenaNet's Guild Wars client, WebAssembly modules, JavaScript glue, game data,
-and filesystem image are fetched from ArenaNet at runtime. They are not part of
-the repository or release packages and are not licensed by gwnative.
+and filesystem image are fetched from ArenaNet at runtime. Full client artifacts
+are not part of the repository or release packages and are not licensed by gwnative.
+The narrow generated-glue excerpts in [`web/fixtures/`](web/fixtures/README.md)
+are pinned test inputs, excluded from the gwnative GPL grant and marked with
+`LicenseRef-ArenaNet-Proprietary`. Their source hashes are recorded alongside them.
 
 The application icon in `packaging/icon.png`, its generated
 `packaging/AppIcon.icns` copy, `docs/assets/app-icon.png`, and the Guild Wars

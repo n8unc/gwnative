@@ -36,8 +36,8 @@ describe('image read tracking', () => {
   });
 
   for (const glue of ['Gw.js', 'Gw.jspi.js']) {
-    it(`cleans rejected and completes successful actual callback in ${glue}`, async () => {
-      const source = readFileSync(new URL(`./${glue}`, import.meta.url), 'utf8');
+    it(`cleans rejected and completes successful generated callback in ${glue}`, async () => {
+      const source = readFileSync(new URL(`./fixtures/${glue}.txt`, import.meta.url), 'utf8');
       const line = source.split('\n').find((entry) => entry.includes('const readPromise = Module.image.readAsync'));
       assert.ok(line);
       const events = [];
@@ -74,7 +74,7 @@ describe('image read tracking', () => {
     });
 
     it(`keeps rejected ImageWait pending until fatal reaction then cleans ${glue}`, async () => {
-      const source = readFileSync(new URL(`./${glue}`, import.meta.url), 'utf8');
+      const source = readFileSync(new URL(`./fixtures/${glue}.txt`, import.meta.url), 'utf8');
       const callbackLine = source.split('\n').find((entry) => entry.includes('const readPromise = Module.image.readAsync'));
       const waitLine = source.split('\n').find((entry) => entry.startsWith('function __asyncjs__EmscriptenExeFileImageWait'));
       assert.ok(callbackLine && waitLine);
@@ -104,7 +104,7 @@ describe('image read tracking', () => {
     });
 
     it(`does not add unhandled rejection when audit cleanup throws (${glue})`, async () => {
-      const source = readFileSync(new URL(`./${glue}`, import.meta.url), 'utf8');
+      const source = readFileSync(new URL(`./fixtures/${glue}.txt`, import.meta.url), 'utf8');
       const line = source.split('\n').find((entry) => entry.includes('const readPromise = Module.image.readAsync'));
       let reject;
       const failure = new Promise((resolve, fail) => { reject = fail; });

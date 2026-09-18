@@ -49,7 +49,7 @@ describe('generated audio resume seam', () => {
     audio.installGameAudioResumeLifecycle();
 
     for (const glue of ['Gw.js', 'Gw.jspi.js']) {
-      const source = readFileSync(new URL(`./${glue}`, import.meta.url), 'utf8');
+      const source = readFileSync(new URL('./fixtures/alc-create-context.txt', import.meta.url), 'utf8');
       const sandbox = vm.createContext({
         document,
         AudioContext: globalThis.AudioContext,

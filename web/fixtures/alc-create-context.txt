@@ -1,0 +1,147 @@
+var autoResumeAudioContext = (ctx) => {
+    for (var event of ['keydown', 'mousedown', 'touchstart']) {
+      for (var element of [document, document.getElementById('canvas')]) {
+        element?.addEventListener(event, () => {
+          if (ctx.state === 'suspended') ctx.resume();
+        }, { 'once': true });
+      }
+    }
+  };
+
+var _alcCreateContext = (deviceId, pAttrList) => {
+    if (!(deviceId in AL.deviceRefCounts)) {
+      AL.alcErr = 0xA001; /* ALC_INVALID_DEVICE */
+      return 0;
+    }
+
+    var options = null;
+    var attrs = [];
+    var hrtf = null;
+    pAttrList >>= 2;
+    if (pAttrList) {
+      var attr = 0;
+      var val = 0;
+      while (true) {
+        attr = HEAP32[pAttrList++];
+        attrs.push(attr);
+        if (attr === 0) {
+          break;
+        }
+        val = HEAP32[pAttrList++];
+        attrs.push(val);
+
+        switch (attr) {
+        case 0x1007 /* ALC_FREQUENCY */:
+          if (!options) {
+            options = {};
+          }
+
+          options.sampleRate = val;
+          break;
+        case 0x1010 /* ALC_MONO_SOURCES */: // fallthrough
+        case 0x1011 /* ALC_STEREO_SOURCES */:
+          // Do nothing; these hints are satisfied by default
+          break
+        case 0x1992 /* ALC_HRTF_SOFT */:
+          switch (val) {
+            case 0:
+              hrtf = false;
+              break;
+            case 1:
+              hrtf = true;
+              break;
+            case 2 /* ALC_DONT_CARE_SOFT */:
+              break;
+            default:
+              AL.alcErr = 40964;
+              return 0;
+          }
+          break;
+        case 0x1996 /* ALC_HRTF_ID_SOFT */:
+          if (val !== 0) {
+            AL.alcErr = 40964;
+            return 0;
+          }
+          break;
+        default:
+          AL.alcErr = 0xA004; /* ALC_INVALID_VALUE */
+          return 0;
+        }
+      }
+    }
+
+    var AudioContext = window.AudioContext || window.webkitAudioContext;
+    var ac = null;
+    try {
+      // Only try to pass options if there are any, for compat with browsers that don't support this
+      if (options) {
+        ac = new AudioContext(options);
+      } else {
+        ac = new AudioContext();
+      }
+    } catch (e) {
+      if (e.name === 'NotSupportedError') {
+        AL.alcErr = 0xA004; /* ALC_INVALID_VALUE */
+      } else {
+        AL.alcErr = 0xA001; /* ALC_INVALID_DEVICE */
+      }
+
+      return 0;
+    }
+
+    autoResumeAudioContext(ac);
+
+    // Old Web Audio API (e.g. Safari 6.0.5) had an inconsistently named createGainNode function.
+    if (typeof ac.createGain == 'undefined') {
+      ac.createGain = ac.createGainNode;
+    }
+
+    var gain = ac.createGain();
+    gain.connect(ac.destination);
+    var ctx = {
+      deviceId,
+      id: AL.newId(),
+      attrs,
+      audioCtx: ac,
+      listener: {
+        position: [0.0, 0.0, 0.0],
+        velocity: [0.0, 0.0, 0.0],
+        direction: [0.0, 0.0, 0.0],
+        up: [0.0, 0.0, 0.0]
+      },
+      sources: [],
+      interval: setInterval(() => AL.scheduleContextAudio(ctx), AL.QUEUE_INTERVAL),
+      gain,
+      distanceModel: 0xd002 /* AL_INVERSE_DISTANCE_CLAMPED */,
+      speedOfSound: 343.3,
+      dopplerFactor: 1.0,
+      sourceDistanceModel: false,
+      hrtf: hrtf || false,
+
+      _err: 0,
+      get err() {
+        return this._err;
+      },
+      set err(val) {
+        // Errors should not be overwritten by later errors until they are cleared by a query.
+        if (this._err === 0 || val === 0) {
+          this._err = val;
+        }
+      }
+    };
+    AL.deviceRefCounts[deviceId]++;
+    AL.contexts[ctx.id] = ctx;
+
+    if (hrtf !== null) {
+      // Apply hrtf attrib to all contexts for this device
+      for (var ctxId in AL.contexts) {
+        var c = AL.contexts[ctxId];
+        if (c.deviceId === deviceId) {
+          c.hrtf = hrtf;
+          AL.updateContextGlobal(c);
+        }
+      }
+    }
+
+    return ctx.id;
+  };

@@ -28,15 +28,13 @@
 //! only way to keep turning once the cursor reaches the edge of the window.
 //!
 //! In Safari a page just gets the lock. In a `WKWebView` it does not: the
-//! request is routed to the application's UI delegate, and WebKit's
-//! `UIDelegate::UIClient::requestPointerLock` ends in `completionHandler(false)`
-//! when no delegate is set or when the one that is set answers neither of the
-//! two selectors below. A host that installs no UI delegate therefore denies
-//! every request its own page makes — and because the page treats a refusal as
-//! "the button is not really down", *every right click died on arrival*, not
-//! merely the camera. That is what this delegate is for. Both spellings are
-//! implemented because WebKit prefers the completion-handler form and falls
-//! back to the older one, and neither is in the public protocol.
+//! request is routed to the application's UI delegate. WebKit's
+//! `UIDelegate::UIClient::requestPointerLock` asks for the private selector
+//! `_webViewDidRequestPointerLock:completionHandler:` and otherwise denies
+//! the request. A similarly named method is never called. Do not implement
+//! `_webViewRequestPointerLock:` alongside it: WebKit prefers that deprecated
+//! notification but then unconditionally denies the request.
+//! Source: WebKit/Source/WebKit/UIProcess/Cocoa/UIDelegate.mm.
 
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -191,8 +189,8 @@ define_class!(
     }
 
     // Empty, and required: `setUIDelegate:` takes an `id<WKUIDelegate>`, and
-    // every method in the protocol is optional. What WebKit actually calls are
-    // the two private selectors below, which it finds by `respondsToSelector:`
+    // every method in the protocol is optional. WebKit looks up the private
+    // selector below with `respondsToSelector:`
     // when the delegate is installed.
     unsafe impl WKUIDelegate for Guard {}
 
@@ -203,18 +201,10 @@ define_class!(
     /// thing that ever asks is the right-drag camera. A prompt here would be a
     /// prompt in the middle of turning around.
     impl Guard {
-        #[unsafe(method(_webView:requestPointerLockWithCompletionHandler:))]
+        #[unsafe(method(_webViewDidRequestPointerLock:completionHandler:))]
         fn request_pointer_lock(&self, _webview: &WKWebView, handler: &DynBlock<dyn Fn(Bool)>) {
             handler.call((Bool::YES,));
         }
-
-        /// The same answer for the older spelling, which has no handler to call
-        /// — WebKit takes the mere presence of this method as consent. Kept
-        /// because `respondsToSelector:` is what decides, so a system that
-        /// stopped asking the first way still gets an answer rather than the
-        /// silent `completionHandler(false)` that having neither means.
-        #[unsafe(method(_webViewDidRequestPointerLock:))]
-        fn did_request_pointer_lock(&self, _webview: &WKWebView) {}
     }
 );
 
@@ -346,23 +336,23 @@ mod tests {
     use objc2::sel;
     use objc2_web_kit::WKNavigationType;
 
-    /// Both pointer-lock selectors are private, so nothing at compile time
-    /// checks that they are spelled the way WebKit looks them up — and a
+    /// The pointer-lock selector is private, so nothing at compile time
+    /// checks that it is spelled the way WebKit looks it up — and a
     /// misspelling is not a crash or a warning. WebKit asks
     /// `respondsToSelector:`, gets no, and answers its own page
-    /// `completionHandler(false)`; the game then behaves as though the right
-    /// mouse button were broken. So the spelling is asserted the same way
+    /// `completionHandler(false)`; camera movement then stops at window edges.
+    /// The spelling is asserted the same way
     /// WebKit reads it.
     #[test]
-    fn webkit_can_find_both_pointer_lock_selectors() {
+    fn webkit_can_find_the_pointer_lock_completion_handler() {
         let class: &AnyClass = Guard::class();
         assert!(
-            class.responds_to(sel!(_webView:requestPointerLockWithCompletionHandler:)),
-            "the form current WebKit prefers"
+            class.responds_to(sel!(_webViewDidRequestPointerLock:completionHandler:)),
+            "WebKit's UIDelegate::UIClient must find the granting callback"
         );
         assert!(
-            class.responds_to(sel!(_webViewDidRequestPointerLock:)),
-            "the fallback WebKit uses when the first is absent"
+            !class.responds_to(sel!(_webViewRequestPointerLock:)),
+            "WebKit's deprecated notification path takes precedence and denies the request"
         );
     }
 

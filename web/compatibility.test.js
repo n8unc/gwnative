@@ -51,6 +51,9 @@ describe('compatibility', () => {
     assert.match(enhancementNotice('uncertified'), /build templates still work/);
     assert.match(enhancementNotice('failed'), /Diagnostics/);
     assert.equal(enhancementNotice('ready'), null);
+    assert.equal(enhancementNotice('ready', 3), null);
+    assert.match(enhancementNotice('ready', 1), /native cursor is available/);
+    assert.match(enhancementNotice('ready', 1), /target-distance/);
     assert.equal(enhancementNotice('off'), null);
   });
 

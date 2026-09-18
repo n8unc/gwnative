@@ -217,10 +217,12 @@ does not inherit a local refusal of the older result.
 ## Passive enhancement boundary
 
 The native cursor and target readout are separate from the template transform.
-They remain disabled until both exact runtime artifacts share the same
-data, element, and global-prefix proof and that proof exactly reproduces the
-most recent certified layout. Agreement between two newly produced runtimes is
-not enough to bless changed offsets.
+Target readout uses the most recent signed passive-layout proof. Cursor-only
+support may use a separately release-reviewed exact-pair certificate, with its
+own layout and feature mask; it still requires matching data, element, and
+global-prefix proofs plus live cursor validation. Agreement between two newly
+produced runtimes alone is not enough to bless changed offsets. See
+`docs/cursor-compatibility.md`.
 
 The companion:
 

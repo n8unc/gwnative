@@ -790,7 +790,7 @@ Module = {
  * Install optional enhancements, if this launch is one that has them.
  *
  * Three things have to line up: the player turned a tool on, the host selected
- * an exact signed runtime certificate, and that certificate carries the
+ * an exact signed or release-bundled certificate, and that certificate carries the
  * passive-observer layout for the same artifact.
  *
  * `enhancements.js` and everything under it is imported here rather than in
@@ -812,7 +812,7 @@ function installTools() {
     !gameInstance
     || !window.__gwnativeEnhancementManifest
   ) {
-    log('[warn] enhancements: the selected runtime carries no signed manifest');
+    log('[warn] enhancements: the selected runtime carries no reviewed manifest');
     return;
   }
   const instance = gameInstance;

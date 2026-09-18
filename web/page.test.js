@@ -100,9 +100,15 @@ describe('the page', () => {
     assert.match(harness, /const MAX_CREDENTIAL_DIAGNOSTICS = 18/);
     assert.match(harness, /if \(suppressPageDiagnostics\) return ''/);
     assert.doesNotMatch(harness, /credential-realm/);
-    assert.match(harness, /if \(launch\.transformed === true\)/);
-    assert.match(harness, /host\.deliverRuntimeProof\('__runtime', launch\)/);
-    assert.match(harness, /host\.deliverRuntimeProof\('__transform-failed'/);
+  });
+
+  it('wires harness lifecycle events through the runtime lifecycle interface', () => {
+    const harness = read('harness.js');
+    assert.match(harness, /host\.createRuntimeLifecycle\(\{/);
+    assert.match(harness, /runtimeLifecycle\.start\(appendGlue\)/);
+    assert.match(harness, /runtimeLifecycle\.instantiate\(instantiate\)/);
+    assert.match(harness, /runtimeLifecycle\.firstFrame\(\)/);
+    assert.match(harness, /runtimeLifecycle\.fail\(message\)/);
   });
 
   it('cancels raw WebKit exception output after queuing only scrubbed text', () => {

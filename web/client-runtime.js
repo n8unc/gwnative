@@ -256,3 +256,161 @@ export async function transitionRuntimeFailure(launch, options = {}) {
   await relaunch();
   return result;
 }
+
+/**
+ * Own launch identity and startup recovery for the generated-client adapter.
+ * The four returned operations are intentionally the only lifecycle surface:
+ * persistence, fallback, first-frame proof, and failure policy stay here while
+ * the harness remains responsible for DOM and generated glue details.
+ *
+ * @param {{ mode: string, wasm: string }} options.client
+ * @param {Record<string, unknown>} options.target
+ * @param {Function} options.relaunch
+ * @param {Record<string, unknown>} options.proofOptions
+ * @param {Function} options.onTransition
+ * @param {Function} options.onOriginalFallback
+ */
+export function createRuntimeLifecycle({
+  client,
+  target = globalThis,
+  relaunch,
+  proofOptions = {},
+  onTransition = () => {},
+  onOriginalFallback = () => {},
+}) {
+  let active;
+  let startPromise;
+  let instantiationPromise;
+  let firstFrameSeen = false;
+  let transitionPromise;
+  let bootProofPromise;
+  let stoppedError;
+  let terminal = false;
+  let attemptInFlight;
+  let transformFailurePromise;
+
+  const proof = (path, body) => deliverRuntimeProof(path, body, proofOptions);
+  const identity = (transformed, source = active) => Object.freeze({
+    runtime: source?.runtime ?? client.mode,
+    build: transformed ? source?.build ?? target.__gwnativeClientBuild : null,
+    transformed,
+    nonce: source?.nonce ?? target.__gwnativeLaunchNonce,
+  });
+
+  const persistAttempt = async (transformed, source = active) => {
+    const launch = identity(transformed, source);
+    const operation = proof('__runtime', launch);
+    attemptInFlight = operation;
+    await operation;
+    active = launch;
+    target.__gwnativeLaunchIdentity = launch;
+    return launch;
+  };
+
+  const start = (loadGlue) => {
+    if (startPromise) return startPromise;
+    if (terminal) return Promise.reject(stoppedError ?? new Error('runtime launch stopped'));
+    startPromise = persistAttempt(
+      target.__gwnativeTemplateSave === 'ready'
+        && typeof target.__gwnativeClientBuild === 'string',
+    ).then((launch) => {
+      if (terminal || stoppedError) throw stoppedError ?? new Error('runtime launch stopped');
+      if (typeof loadGlue === 'function') loadGlue();
+      return launch;
+    });
+    return startPromise;
+  };
+
+  const instantiate = (load) => {
+    if (instantiationPromise) return instantiationPromise;
+    instantiationPromise = (async () => {
+      const source = client.wasm;
+      if (terminal || firstFrameSeen) throw stoppedError ?? new Error('runtime launch stopped');
+      try {
+        const result = await load(source);
+        if (terminal || firstFrameSeen) throw stoppedError ?? new Error('runtime launch stopped');
+        return result;
+      } catch (error) {
+        if (!active?.transformed || firstFrameSeen || terminal) throw error;
+        transformFailurePromise ??= proof('__transform-failed', { launch: active });
+        await transformFailurePromise;
+        if (terminal || firstFrameSeen) throw stoppedError ?? error;
+        target.__gwnativeTemplateSave = 'failed';
+        target.__gwnativeEnhancements = 'off';
+        target.__gwnativeEnhancementManifest = null;
+        try { onOriginalFallback(error); } catch { /* notification cannot alter policy */ }
+        const original = await persistAttempt(false, active);
+        if (terminal || firstFrameSeen) throw stoppedError ?? error;
+        const result = await load(`${source}?gwnative-original=1`, original);
+        if (terminal || firstFrameSeen) throw stoppedError ?? error;
+        return result;
+      }
+    })();
+    return instantiationPromise;
+  };
+
+  const firstFrame = () => {
+    if (firstFrameSeen) return bootProofPromise;
+    firstFrameSeen = true;
+    if (!active) {
+      bootProofPromise = Promise.reject(new Error('first frame has no launch identity'));
+      return bootProofPromise;
+    }
+    bootProofPromise ??= proof('__booted', { launch: active }).catch((error) => {
+      throw error;
+    });
+    return bootProofPromise;
+  };
+
+  const fail = (reason) => {
+    const error = reason instanceof Error ? reason : new Error(String(reason));
+    if (firstFrameSeen) {
+      const stopped = new Error(`The game client stopped unexpectedly: ${error.message}`);
+      stoppedError ??= stopped;
+      return Promise.reject(stoppedError);
+    }
+    if (transitionPromise) return transitionPromise;
+    const acknowledgedAtInvocation = Boolean(active);
+    terminal = true;
+    stoppedError = new Error(`The game client stopped unexpectedly: ${error.message}`);
+    transitionPromise = (async () => {
+      let launch;
+      try {
+        if (!acknowledgedAtInvocation) throw stoppedError;
+        if (attemptInFlight) await attemptInFlight;
+        launch = active;
+        if (!launch) throw stoppedError;
+      } catch (cause) {
+        throw cause;
+      }
+      if (firstFrameSeen) throw stoppedError;
+      if (launch.transformed) {
+        transformFailurePromise ??= proof('__transform-failed', { launch });
+        await transformFailurePromise;
+        if (firstFrameSeen) throw stoppedError;
+        if (typeof relaunch !== 'function') throw new Error('runtime transition has no fresh-realm relaunch');
+        try { onTransition(error); } catch { /* notification cannot alter policy */ }
+        await relaunch();
+        return;
+      }
+      if (typeof relaunch !== 'function') throw new Error('runtime transition has no fresh-realm relaunch');
+      if (firstFrameSeen) throw stoppedError;
+      await transitionRuntimeFailure(launch, {
+        ...proofOptions,
+        relaunch: async () => {
+          if (firstFrameSeen) throw stoppedError;
+          try { onTransition(error); } catch { /* notification cannot alter policy */ }
+          return relaunch();
+        },
+      });
+    })().catch((failure) => {
+      if (failure === stoppedError) throw failure;
+      const wrapped = new Error(`The game client could not start: ${failure?.message ?? failure}`);
+      stoppedError = wrapped;
+      throw wrapped;
+    });
+    return transitionPromise;
+  };
+
+  return Object.freeze({ start, instantiate, firstFrame, fail });
+}

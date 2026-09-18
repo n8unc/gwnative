@@ -545,6 +545,9 @@ Module = {
   // Take over instantiation so the EGL imports can be patched before the
   // client ever calls them.
   instantiateWasm(imports, success) {
+    // Classic generated glues expose autoResumeAudioContext as a global var.
+    // Replace it synchronously before createWasm can create an audio context.
+    host.installGameAudioResumeLifecycle?.();
     host.installGraphics({
       env: imports.env,
       canvas: Module.canvas,
@@ -854,7 +857,7 @@ function runtimeFailedBeforeProof(reason) {
   try {
     const [
       graphics, audio, memory, filesystem, image, sockets, platform, input, templates, prefs,
-      start, panel, data, compat, guide, gameApi, metrics, runtime, audit,
+      start, panel, data, compat, guide, gameApi, metrics, runtime, audit, imageReads,
     ] = await Promise.all([
       import('./graphics.js'),
       import('./audio.js'),
@@ -875,6 +878,7 @@ function runtimeFailedBeforeProof(reason) {
       import('./diagnostics.js'),
       import('./client-runtime.js'),
       import('./frame-audit.js'),
+      import('./image-read-tracking.js'),
     ]);
     host = {
       ...graphics,
@@ -895,6 +899,7 @@ function runtimeFailedBeforeProof(reason) {
       ...gameApi,
       ...runtime,
       ...audit,
+      ...imageReads,
     };
     // Kept out of the host bag: `count`, `gauge` and `peak` are names the game
     // contract could plausibly want for something else.
@@ -935,32 +940,13 @@ function runtimeFailedBeforeProof(reason) {
     }),
   });
   window.gwFrameAudit = frameAudit;
-  if (frameAudit.enabled) {
-    // ArenaNet creates this Map lazily for background reads, then the
-    // suspending ImageWait import obtains the Promise with get().  Supplying a
-    // normal Map with get and delete wrapped lets the audit distinguish "read
-    // in flight" from "the Wasm stack is waiting for that read". Completion is
-    // observed at the delete the generated glue already performs, so the audit
-    // attaches no Promise reaction of its own.
-    const imageReads = new Map();
-    const getImageRead = imageReads.get.bind(imageReads);
-    const setImageRead = imageReads.set.bind(imageReads);
-    const deleteImageRead = imageReads.delete.bind(imageReads);
-    imageReads.get = (id) => frameAudit.trackImageWait(getImageRead(id), id);
-    imageReads.set = (id, promise) => {
-      frameAudit.imageReadQueued(id, promise);
-      setImageRead(id, promise);
-      return imageReads;
-    };
-    imageReads.delete = (id) => {
-      const deleted = deleteImageRead(id);
-      frameAudit.imageReadResolved(id);
-      return deleted;
-    };
-    Module.imageReads = imageReads;
-    Module.imageReadsSequence = 1;
-    log('frame audit: detailed callback/draw correlation enabled');
-  }
+  // Install before generated glue: failed reads must be removed even though
+  // glue only deletes successful reads. Promise identity remains untouched.
+  Module.imageReads = host.createImageReadTracking({
+    frameAudit: frameAudit.enabled ? frameAudit : null,
+  });
+  Module.imageReadsSequence = 1;
+  if (frameAudit.enabled) log('frame audit: detailed callback/draw correlation enabled');
   host.applyClientLimits(client, host.currentSettings(), window);
   runtimeLifecycle = host.createRuntimeLifecycle({
     client,

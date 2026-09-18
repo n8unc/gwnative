@@ -22,6 +22,36 @@ import * as diagnostics from './diagnostics.js';
  */
 const captured = [];
 let muted = false;
+const resumeListeners = new WeakMap();
+
+const removeResumeListeners = (entry) => {
+  for (const { target, type, listener } of resumeListeners.get(entry) ?? []) {
+    target.removeEventListener(type, listener);
+  }
+  resumeListeners.delete(entry);
+};
+
+const addResumeListeners = (entry) => {
+  const targets = [window.document, window.document?.getElementById?.('canvas')].filter(Boolean);
+  const listeners = [];
+  for (const type of ['keydown', 'mousedown', 'touchstart']) {
+    for (const target of targets) {
+      const listener = () => {
+        if (entry.pending || entry.context.state !== 'suspended') {
+          if (entry.context.state !== 'suspended') removeResumeListeners(entry);
+          return;
+        }
+        entry.pending = entry.context.resume().then(
+          () => removeResumeListeners(entry),
+          () => { entry.pending = null; },
+        );
+      };
+      target.addEventListener(type, listener);
+      listeners.push({ target, type, listener });
+    }
+  }
+  resumeListeners.set(entry, listeners);
+};
 
 /**
  * A ramp rather than a step. 20 ms is short enough to read as instant and long
@@ -117,6 +147,7 @@ const closeStale = () => {
     for (const entry of stale) {
       const index = captured.indexOf(entry);
       if (index !== -1) captured.splice(index, 1);
+      removeResumeListeners(entry);
       if (entry.context.state === 'closed') continue;
       entry.context
         .close()
@@ -143,12 +174,14 @@ const capture = (context) => {
     configurable: true,
   });
 
-  captured.push({ context, master, closing: false });
+  const entry = { context, master, closing: false };
+  captured.push(entry);
   closeStale();
 
   diagnostics.count('gw.audio.context.created');
   diagnostics.gauge('gw.audio.sampleRate', context.sampleRate);
   context.addEventListener('statechange', () => {
+    if (context.state === 'closed') removeResumeListeners(entry);
     diagnostics.count(`gw.audio.state.${context.state}`);
     // Latency is only meaningful once the context is actually running, and the
     // client never reports it. It is the number that decides whether a sound
@@ -193,4 +226,23 @@ export function installGameAudio() {
   });
 
   return { setGameAudioMuted, resumeGameAudio, gameAudioState };
+}
+
+/** Replace classic glue's global auto-resume hook before it creates contexts. */
+export function installGameAudioResumeLifecycle({ target = window } = {}) {
+  if (!target || typeof target.autoResumeAudioContext !== 'function') {
+    console.log('[warn] audio resume lifecycle unavailable; using client hook');
+    return false;
+  }
+  const original = target.autoResumeAudioContext;
+  target.autoResumeAudioContext = (context) => {
+    const entry = captured.find((candidate) => candidate.context === context) ?? null;
+    if (!entry) {
+      console.log('[warn] audio resume lifecycle could not associate context');
+      return original(context);
+    }
+    if (context.state === 'running' || context.state === 'closed') return;
+    addResumeListeners(entry);
+  };
+  return true;
 }

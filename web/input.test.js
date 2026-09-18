@@ -120,7 +120,7 @@ function rightUp(harness) {
 }
 
 describe('right-drag pointer lock', () => {
-  it('uses relative motion after lock, beyond canvas coordinates, then releases it', () => {
+  it('uses relative motion after lock, then releases it', () => {
     let requests = 0;
     const harness = setup({ requestPointerLock: () => { requests += 1; } });
     const mousemoves = [];
@@ -130,14 +130,46 @@ describe('right-drag pointer lock', () => {
     assert.equal(requests, 1);
     harness.document.pointerLockElement = harness.canvas;
     harness.document.dispatchEvent(new FakeMouseEvent('pointerlockchange'));
-    const movement = trusted('mousemove', { movementX: 600, movementY: -300 });
+    const movement = trusted('mousemove', { movementX: 600, movementY: -100 });
     harness.document.dispatchEvent(movement);
 
     assert.equal(movement.defaultPrevented, true);
-    assert.equal(mousemoves.length, 1);
-    assert.equal(mousemoves[0].movementX, 600);
-    assert.equal(mousemoves[0].movementY, -300);
-    assert.ok(mousemoves[0].clientX > 100, 'relative drag can pass canvas edge');
+    assert.equal(mousemoves.reduce((sum, event) => sum + event.movementX, 0), 600);
+    assert.equal(mousemoves.reduce((sum, event) => sum + event.movementY, 0), -100);
+    assert.ok(mousemoves.every((event) => event.clientX >= 0));
+    assert.ok(mousemoves.every((event) => event.clientY >= 0));
+    assert.equal(harness.classes.has('cursor-hidden'), true);
+
+    rightUp(harness);
+    assert.equal(harness.exits(), 1);
+    assert.equal(harness.classes.has('cursor-hidden'), false);
+  });
+
+  it('keeps client coordinates nonnegative across repeated reanchors and reversal', () => {
+    const harness = setup();
+    const mousemoves = [];
+    harness.canvas.addEventListener('mousemove', (event) => mousemoves.push(event));
+
+    rightDown(harness);
+    harness.document.pointerLockElement = harness.canvas;
+    harness.document.dispatchEvent(new FakeMouseEvent('pointerlockchange'));
+
+    const movements = Array.from({ length: 120 }, (_, index) =>
+      index < 60 ? [-80, -30] : [80, 30]);
+    const batches = [];
+    for (const [movementX, movementY] of movements) {
+      const start = mousemoves.length;
+      harness.document.dispatchEvent(trusted('mousemove', { movementX, movementY }));
+      batches.push(mousemoves.slice(start));
+    }
+
+    assert.ok(mousemoves.length > movements.length, 'long drags should re-anchor');
+    assert.ok(mousemoves.every((event) => event.clientX >= 0 && event.clientY >= 0));
+    for (const [batch, [movementX, movementY]] of movements.map((movement, index) =>
+      [batches[index], movement])) {
+      assert.equal(batch.reduce((sum, event) => sum + event.movementX, 0), movementX);
+      assert.equal(batch.reduce((sum, event) => sum + event.movementY, 0), movementY);
+    }
     assert.equal(harness.classes.has('cursor-hidden'), true);
 
     rightUp(harness);

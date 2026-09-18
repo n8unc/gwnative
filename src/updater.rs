@@ -58,15 +58,110 @@
 
 use std::cell::RefCell;
 use std::ffi::c_void;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use objc2::msg_send;
 use objc2::rc::{Allocated, Retained};
 use objc2::runtime::{AnyClass, AnyObject, Bool};
 use objc2_foundation::{MainThreadMarker, NSBundle, NSError, NSString, NSUserDefaults};
 
-use crate::{app, settings};
+use crate::{app, instance, settings};
+
+/// Excludes every game profile while a future helper replaces application.
+///
+/// Launcher currently performs metadata checks only. A future staged-update
+/// helper must take this gate before application replacement. The catalog lease
+/// closes the other half of that race: a direct named-profile launch has to
+/// take `profiles.lock` before it can create or select support directory, so
+/// it cannot appear after this gate enumerates directories and before helper
+/// installation starts.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub struct LauncherUpdateGate {
+    support_root: PathBuf,
+}
+
+#[allow(dead_code)]
+impl LauncherUpdateGate {
+    pub fn new(support_root: PathBuf) -> Self {
+        Self { support_root }
+    }
+
+    /// Take every profile's exclusion lock without waiting. `Ok(None)` means
+    /// a game or profile allocation is in progress, so installation stays
+    /// deferred. Holding returned lease rejects a direct launch until Sparkle
+    /// has accepted its installation handoff.
+    pub fn try_acquire(&self) -> Result<Option<UpdateInstallLease>, String> {
+        let catalog =
+            match instance::acquire(&self.support_root.join("profiles.lock"), Duration::ZERO) {
+                Ok(lock) => lock,
+                Err(_) => return Ok(None),
+            };
+        let mut directories = profile_directories(&self.support_root)?;
+        directories.sort();
+        directories.dedup();
+        let mut profiles = Vec::with_capacity(directories.len());
+        for support_dir in directories {
+            match instance::acquire(&support_dir.join("gwnative.lock"), Duration::ZERO) {
+                Ok(lock) => profiles.push(lock),
+                Err(_) => return Ok(None),
+            }
+        }
+        Ok(Some(UpdateInstallLease {
+            _catalog: catalog,
+            _profiles: profiles,
+        }))
+    }
+
+    /// Reserve a launcher process's final exit. Root keeps this lease until
+    /// process termination; otherwise a direct game could begin after the
+    /// last idle check and before Sparkle or a future helper replaces bundle.
+    pub fn prepare_termination(&self) -> Result<Option<LauncherTerminationLease>, String> {
+        self.try_acquire()
+            .map(|lease| lease.map(|lease| LauncherTerminationLease { _lease: lease }))
+    }
+}
+
+/// Held from final idle check until update helper takes installation handoff.
+/// Dropping it re-enables ordinary profile launches.
+#[allow(dead_code)]
+pub struct UpdateInstallLease {
+    _catalog: instance::Instance,
+    _profiles: Vec<instance::Instance>,
+}
+
+/// Proof that no game may survive launcher's final termination. This is an
+/// explicit future-helper seam, not permission to install through Sparkle.
+#[allow(dead_code)]
+pub struct LauncherTerminationLease {
+    _lease: UpdateInstallLease,
+}
+
+#[allow(dead_code)]
+fn profile_directories(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut directories = vec![root.to_owned()];
+    let profiles = root.join("profiles");
+    let entries = match std::fs::read_dir(&profiles) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(directories),
+        Err(error) => return Err(format!("could not list {}: {error}", profiles.display())),
+    };
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| format!("could not read {}: {error}", profiles.display()))?;
+        if entry
+            .file_type()
+            .map_err(|error| format!("could not inspect {}: {error}", entry.path().display()))?
+            .is_dir()
+        {
+            directories.push(entry.path());
+        }
+    }
+    Ok(directories)
+}
 
 /// The Info.plist keys Sparkle cannot run without: where the feed is, and the
 /// public half of the key every item in it must be signed with. `scripts/bundle`
@@ -120,11 +215,17 @@ pub fn started() -> bool {
 ///
 /// Returns whether the updater is now running, which is what decides whether
 /// [`crate::release`] does anything this launch.
+#[allow(dead_code)] // Retained for the separate installer helper; never started by game processes.
 pub fn start(_mtm: MainThreadMarker, store: &Arc<settings::ScopedStore>) -> bool {
+    start_with(store, None)
+}
+
+#[allow(dead_code)] // Retained for the separate installer helper; never started by game processes.
+fn start_with(store: &Arc<settings::ScopedStore>, delegate: Option<&AnyObject>) -> bool {
     if !available() {
         return false;
     }
-    let Some(updater) = build() else {
+    let Some(updater) = build(delegate) else {
         return false;
     };
 
@@ -246,15 +347,17 @@ extern "C" fn apply(context: *mut c_void) {
 /// front of the player telling them to contact the developer — the one outcome
 /// worth avoiding here, because "misconfigured" covers every build that simply
 /// has no signing key yet. This one hands the error to the log.
-fn build() -> Option<Retained<AnyObject>> {
+#[allow(dead_code)] // Retained for the separate installer helper; never started by game processes.
+fn build(delegate: Option<&AnyObject>) -> Option<Retained<AnyObject>> {
     let updater_class = AnyClass::get(c"SPUUpdater")?;
     let driver_class = AnyClass::get(c"SPUStandardUserDriver")?;
     let bundle = NSBundle::mainBundle();
 
     // SAFETY: both initialisers are the ones the framework's headers declare,
-    // sent to a freshly allocated instance of the class that declares them,
-    // with an object for every object argument and nil for the two delegates —
-    // documented nullable, and this build has nothing to say to either.
+    // sent to freshly allocated instances of the classes that declare them,
+    // with an object for every object argument. The user-driver delegate is
+    // nil; updater delegate is nil for a game host and retained launcher
+    // delegate when application-install timing needs profile exclusion.
     unsafe {
         let driver: Allocated<AnyObject> = msg_send![driver_class, alloc];
         let driver: Retained<AnyObject> =
@@ -266,7 +369,7 @@ fn build() -> Option<Retained<AnyObject>> {
             initWithHostBundle: &*bundle,
             applicationBundle: &*bundle,
             userDriver: &*driver,
-            delegate: None::<&AnyObject>,
+            delegate: delegate,
         ];
 
         let mut error: *mut NSError = ptr::null_mut();
@@ -326,6 +429,7 @@ fn intent(updater: &AnyObject) -> (bool, bool) {
 /// overwrite what the player just ticked there. Where it has none — a fresh
 /// install, or the first launch after Sparkle shipped — the profile is all there
 /// is, and it carries an opt-in that predates the framework.
+#[allow(dead_code)] // Retained for the separate installer helper; never started by game processes.
 fn reconcile(profile: (bool, bool), stored: (bool, bool), answered: (bool, bool)) -> (bool, bool) {
     (
         if answered.0 { stored.0 } else { profile.0 },
@@ -381,7 +485,10 @@ fn default_set(key: &str) -> bool {
 // wrong — the profile and the framework disagreeing about who asked for what.
 #[cfg(test)]
 mod tests {
-    use super::reconcile;
+    use std::time::Duration;
+
+    use super::{LauncherUpdateGate, reconcile};
+    use crate::instance;
 
     const NEITHER: (bool, bool) = (false, false);
     const BOTH: (bool, bool) = (true, true);
@@ -423,5 +530,58 @@ mod tests {
         assert_eq!(reconcile(BOTH, (false, true), BOTH), (false, true));
         // And back on again, with the opt-in still where the player left it.
         assert_eq!(reconcile((true, true), (true, true), BOTH), BOTH);
+    }
+
+    fn gate_scratch(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "gwnative-update-gate-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn launcher_update_gate_defers_until_every_existing_game_releases_its_profile() {
+        let root = gate_scratch("existing");
+        let named = root.join("profiles/iron");
+        std::fs::create_dir_all(&named).unwrap();
+        let game = instance::acquire(&named.join("gwnative.lock"), Duration::ZERO).unwrap();
+        let gate = LauncherUpdateGate::new(root.clone());
+        assert!(gate.try_acquire().unwrap().is_none());
+
+        drop(game);
+        let lease = gate.try_acquire().unwrap().expect("all games are closed");
+        assert!(instance::acquire(&root.join("gwnative.lock"), Duration::ZERO).is_err());
+        assert!(instance::acquire(&named.join("gwnative.lock"), Duration::ZERO).is_err());
+        drop(lease);
+        assert!(instance::acquire(&named.join("gwnative.lock"), Duration::ZERO).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn launcher_update_gate_blocks_new_named_profile_allocation_during_handoff() {
+        let root = gate_scratch("catalog");
+        let gate = LauncherUpdateGate::new(root.clone());
+        let lease = gate
+            .prepare_termination()
+            .unwrap()
+            .expect("empty catalog is idle");
+        let (sent, received) = std::sync::mpsc::channel();
+        let allocating = root.clone();
+        let joining = std::thread::spawn(move || {
+            sent.send(crate::profile::select(&allocating, Some("iron")).is_ok())
+                .unwrap();
+        });
+        assert!(
+            received.recv_timeout(Duration::from_millis(80)).is_err(),
+            "profile allocation must wait behind installation lease"
+        );
+        drop(lease);
+        assert!(received.recv_timeout(Duration::from_secs(1)).unwrap());
+        joining.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

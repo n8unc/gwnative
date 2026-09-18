@@ -353,6 +353,11 @@ fn credentials(
     stream: &mut TcpStream,
     context: &Context,
 ) -> std::io::Result<()> {
+    // Launcher-owned credentials flow into the game only. A client's remember
+    // or sign-out operation must not overwrite or delete launcher records.
+    if crate::launcher::managed_game() && matches!(request.method.as_str(), "PUT" | "DELETE") {
+        return no_content(stream);
+    }
     match request.method.as_str() {
         "GET" => match keychain::load(&context.credential_account) {
             Some(credentials) => {

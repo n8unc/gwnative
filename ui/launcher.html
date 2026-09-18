@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Guild Wars · Accounts</title>
+  <style>/* LAUNCHER_STYLE */</style>
+</head>
+<body>
+  <header>
+    <div><p class="eyebrow">GUILD WARS</p><h1>Your accounts</h1><p class="subtitle">Separate settings. Shared game files.</p></div>
+    <button id="add" class="primary">＋ Add Account</button>
+  </header>
+  <div id="notice" role="status" aria-live="polite" hidden></div>
+  <section class="update-bar" aria-label="Updates"><span class="status-dot"></span><span id="update-status">Checking client updates…</span><button id="check-updates" class="quiet">Check now</button></section>
+  <main>
+    <div class="list-heading"><span id="account-count">Accounts</span><span class="hint">Separate settings · Shared game content</span></div>
+    <div id="accounts" aria-label="Accounts"></div>
+    <div id="empty" hidden><div class="empty-mark">◇</div><h2>A place for every account</h2><p>Add your Guild Wars login to get started.<br>Your game files stay shared; your settings stay yours.</p><button id="empty-add" class="primary">Add your first Account</button></div>
+  </main>
+  <footer><button id="launch-selected" disabled class="primary">Launch selected</button><span id="selection-count" class="hint">Select accounts to launch together</span><div class="footer-menu"><button id="adopt" class="quiet">Import existing…</button><button id="quit-all" class="quiet">Quit all…</button></div></footer>
+
+  <dialog id="editor" aria-labelledby="editor-title">
+    <form id="account-form">
+      <h2 id="editor-title">Add Account</h2><p class="hint">Use an existing Guild Wars login.</p>
+      <label for="nickname">Nickname</label><input id="nickname" name="nickname" required maxlength="80" autocomplete="off" placeholder="Main account">
+      <label for="email">Login email</label><input id="email" name="email" type="email" required maxlength="254" autocomplete="username" spellcheck="false">
+      <label for="password">Password <span class="hint">optional</span></label><input id="password" name="password" type="password" autocomplete="new-password" maxlength="1024">
+      <p id="password-hint" class="hint">Stored securely in macOS Keychain.</p>
+      <label class="check" id="remove-password-row" hidden><input id="remove-password" type="checkbox">Remove saved password</label>
+      <label class="check"><input id="auto-login" type="checkbox" disabled>Auto-login unavailable <span class="hint">Credentials will be prefilled; click Log In in the game.</span></label>
+      <label class="check"><input id="auto-launch" type="checkbox">Auto-launch <span class="hint">Start when the launcher opens</span></label>
+      <p id="form-error" role="alert" hidden></p>
+      <div class="dialog-actions"><button type="button" id="remove-account" class="danger" hidden>Remove…</button><span class="spacer"></span><button type="button" id="cancel-edit">Cancel</button><button type="submit" id="save" class="primary">Save Account</button></div>
+    </form>
+  </dialog>
+  <dialog id="confirmation" aria-labelledby="confirm-title"><h2 id="confirm-title"></h2><p id="confirm-message"></p><div id="confirm-options"></div><div class="dialog-actions"><button id="confirm-cancel">Cancel</button><button id="confirm-yes" class="primary">Continue</button></div></dialog>
+  <dialog id="imports" aria-labelledby="imports-title"><h2 id="imports-title">Existing profiles</h2><p class="hint">Choose a profile to review. Importing never starts a game.</p><div id="import-list"></div><div class="dialog-actions"><button id="close-imports">Done</button></div></dialog>
+  <script>/* LAUNCHER_SCRIPT */</script>
+</body>
+</html>

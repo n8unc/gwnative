@@ -107,15 +107,20 @@ Mac with Xcode Command Line Tools and `rustup` installed:
 cargo run
 ```
 
-The first run downloads missing client artifacts. A stable signing identity is
-recommended because macOS associates Keychain access with the executable's code
+This checkout opens the development account launcher. Account management and
+manual-login session controls are implemented; automatic login and application
+update installation remain incomplete. See [implementation status](docs/launcher-implementation.md)
+for validation limits. The first game start downloads missing client artifacts.
+
+A stable signing identity is recommended because macOS associates Keychain access with the executable's code
 signature; development runs still work without one.
 
 Useful commands:
 
 | Command | Purpose |
 | --- | --- |
-| `cargo run` | Open the game window |
+| `cargo run` | Open the account launcher |
+| `cargo run -- run` | Open a game window directly |
 | `cargo run -- sync` | Refresh the client artifacts and exit |
 | `cargo run -- serve` | Run the loopback origin without a window |
 | `cargo test` | Run the Rust and dependency-free JavaScript tests |

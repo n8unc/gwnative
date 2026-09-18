@@ -29,6 +29,10 @@ mod generation_state;
 mod http;
 mod instance;
 mod keychain;
+mod launcher;
+mod launcher_accounts;
+mod launcher_removal;
+mod launcher_sessions;
 mod layout;
 mod manifest;
 mod menu;
@@ -89,6 +93,12 @@ fn main() {
     // Validate and take the explicitly inherited supervisor pipe before this
     // process opens any file that could reuse a stale descriptor number.
     let control = control_pipe();
+    if invocation.opens_launcher() && !relaunch::is_successor() {
+        if let Err(reason) = launcher::run(&invocation) {
+            alert::fatal(true, "The launcher could not open", &reason);
+        }
+        return;
+    }
     if let Some((username, password)) = invocation.take_credentials() {
         match keychain::Credentials::new(username, password) {
             Ok(credentials) => {
@@ -167,6 +177,24 @@ fn main() {
     // that would otherwise put a message on screen asks this first.
     let windowed = !headless && !maintenance;
 
+    // Held for as long as the process lives; the kernel takes it back if the
+    // process does not.
+    let (profile_instance, _global_instance) = hold_the_only_instance(
+        windowed,
+        &paths,
+        invocation.new_instance || invocation.game_mode,
+    );
+    let launcher_account = if matches!(command, cli::Command::Run | cli::Command::Serve) {
+        launcher::register_game(&profile.id).unwrap_or_else(|reason| {
+            alert::fatal(
+                command == cli::Command::Run,
+                "The Account could not be opened",
+                &reason,
+            )
+        })
+    } else {
+        None
+    };
     if matches!(command, cli::Command::Run | cli::Command::Serve)
         && let Err(error) = keychain::prime(&profile.keychain_account())
     {
@@ -177,9 +205,22 @@ fn main() {
         );
     }
 
-    // Held for as long as the process lives; the kernel takes it back if the
-    // process does not.
-    let _instance = hold_the_only_instance(windowed, &paths, invocation.new_instance);
+    let mut direct_instance = None;
+    let game_control = if windowed && (invocation.game_mode || launcher_account.is_some()) {
+        let host = launcher_sessions::GameHost::start(
+            paths.support_dir().to_owned(),
+            &profile.id,
+            profile_instance,
+        )
+        .unwrap_or_else(|reason| alert::fatal(true, "The game session could not start", &reason));
+        Some(launcher::start_game_control(host).unwrap_or_else(|reason| {
+            alert::fatal(true, "The game session could not start", &reason)
+        }))
+    } else {
+        direct_instance = Some(profile_instance);
+        None
+    };
+    let _direct_instance = direct_instance;
 
     // Profiles share the content-addressed game-data cache even though their
     // client manifests are isolated. Hold this before any active manifest can
@@ -455,6 +496,12 @@ fn main() {
         paths.support_dir(),
         profile.website_data_store_id(),
         (root, generations),
+        GameWindowAccount {
+            control: game_control,
+            nickname: launcher_account
+                .as_ref()
+                .map(|account| account.nickname.as_str()),
+        },
     );
 }
 
@@ -576,7 +623,9 @@ fn hold_the_only_instance(
 fn acquire_instance(windowed: bool, lock_path: &Path) -> instance::Instance {
     // A relaunch is started by the app it replaces, so for a moment there
     // really are two — and this is the one that has to wait for the other.
-    let patience = if relaunch::is_successor() {
+    let launcher_reservation =
+        std::env::var_os("GWNATIVE_LAUNCHER_STARTING").is_some_and(|value| value == "1");
+    let patience = if relaunch::is_successor() || launcher_reservation {
         relaunch::PATIENCE
     } else {
         std::time::Duration::ZERO
@@ -870,6 +919,12 @@ fn park_headless(loopback: &server::Loopback) -> ! {
     }
 }
 
+/// Launcher-owned controls and display metadata for one game window.
+struct GameWindowAccount<'a> {
+    control: Option<Arc<std::sync::Mutex<launcher_sessions::GameHost>>>,
+    nickname: Option<&'a str>,
+}
+
 /// Build the window and hand the thread to AppKit. Returns once the app has
 /// terminated.
 fn run_windowed(
@@ -879,6 +934,7 @@ fn run_windowed(
     support_dir: &Path,
     website_data_store_id: Option<&str>,
     recovery: (PathBuf, Arc<generation::Store>),
+    account: GameWindowAccount<'_>,
 ) {
     let mtm = MainThreadMarker::new().expect("main thread");
     let app = NSApplication::sharedApplication(mtm);
@@ -887,16 +943,8 @@ fn run_windowed(
     // icon set afterwards is one the player can watch change.
     dock::set_icon(mtm);
 
-    // Before the web view, because the page is handed the settings it starts
-    // with and the updater is allowed to change two of them: on the first
-    // launch after Sparkle shipped, the profile's opt-in is what seeds it, and
-    // afterwards the updater's own answer is what the panel has to show.
-    let automatic_updates_allowed = invocation.automatic_updates_allowed();
-    if automatic_updates_allowed {
-        updater::start(mtm, &loopback.settings);
-    } else {
-        note!("[gwnative] automatic application update checks disabled for this launch");
-    }
+    // Application replacement belongs to the launcher. Sparkle's termination
+    // install path cannot safely run in a game while peer games remain alive.
 
     // The frame the web view is created at does not matter: `window::open`
     // resizes the window to the remembered one before it is ever shown, and the
@@ -923,6 +971,17 @@ fn run_windowed(
         support_dir.join("window.json"),
         invocation.legacy.window_mode,
     );
+    if let Some(nickname) = account.nickname {
+        window.setTitle(&objc2_foundation::NSString::from_str(&format!(
+            "{nickname} · Guild Wars"
+        )));
+        let profile_id = invocation
+            .profile
+            .as_deref()
+            .unwrap_or("default")
+            .to_owned();
+        launcher::track_game_title(window.clone(), profile_id, nickname.to_owned());
+    }
     activation_cover::install(&webview, &window, loopback.recorder.clone());
 
     // After the window, not before: two of the menu's items are requests to the
@@ -949,15 +1008,12 @@ fn run_windowed(
     // window quits — can be asked the moment the window appears.
     app::own_lifecycle(mtm, &webview);
 
-    // After the menu, because the answer is shown through the same alert its
-    // item uses, and off this thread — the request takes up to five seconds and
-    // the page is loading. A no-op unless the player asked to be told; see
-    // [`release::due`].
-    if automatic_updates_allowed {
-        menu::check_for_updates_at_launch(&loopback.settings);
-    }
-
     window.makeKeyAndOrderFront(None);
+    if let Some(control) = account.control.as_ref()
+        && let Ok(mut host) = control.lock()
+    {
+        host.ready();
+    }
     app.activate();
     // The last thing before the thread stops being ours. `app::request_quit`
     // reads this to know a `terminate:` will be heard.

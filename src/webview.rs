@@ -200,7 +200,8 @@ fn preamble(
          window.__gwnativeEnhancementManifest = null;\nwindow.__gwnativeClientRuntime = {};\n\
          window.__gwnativeFrameAuditEnabled = {};\nwindow.__gwnativePrefer60FPS = {};\n\
          window.__gwnativePreserveDrawingBuffer = {};\nwindow.__gwnativeFrameIsolation = {};\n\
-         window.__gwnativeLaunch = {};",
+         window.__gwnativeLaunch = {};\n\
+         window.__gwnativeManagedAccount = {};",
         serde_json::Value::from(token),
         serde_json::Value::from(game_publisher_token),
         serde_json::Value::from(launch_nonce),
@@ -224,6 +225,7 @@ fn preamble(
         serde_json::Value::from(frame.preserve_drawing_buffer),
         serde_json::Value::from(frame.isolation),
         invocation.client_json(),
+        crate::launcher::managed_game(),
     )
 }
 

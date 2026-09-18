@@ -635,6 +635,15 @@ Module = {
       );
       log('wasm instantiated');
       gameInstance = result.instance;
+      // Before the glue resumes constructors/main: the client builds its login
+      // UI only once. Keychain values stay on secureStorage; this enables only
+      // the certified per-instance request gate, never automatic submission.
+      await host.prepareLauncherCredentials({
+        managed: window.__gwnativeManagedAccount === true,
+        readSaved,
+        exports: gameInstance.exports,
+        log,
+      });
       success(result.instance, result.module);
     })().catch(runtimeFailedBeforeProof);
 
@@ -686,6 +695,11 @@ Module = {
       return stored;
     },
     async storeCredentials(username, password) {
+      // The launcher owns this record, including its in-page cached value.
+      if (window.__gwnativeManagedAccount === true) {
+        protectCredentials({ username, password });
+        return;
+      }
       const previous = await readSaved().catch(() => null);
       protectCredentials({ username, password });
       const response = await credentials('PUT', { username, password });
@@ -700,6 +714,7 @@ Module = {
       saved = Promise.resolve({ username, password });
     },
     async clearCredentials() {
+      if (window.__gwnativeManagedAccount === true) return;
       const response = await credentials('DELETE');
       if (!response.ok) {
         throw new Error((await response.text()) || `credential deletion failed: ${response.status}`);
@@ -857,7 +872,7 @@ function runtimeFailedBeforeProof(reason) {
   try {
     const [
       graphics, audio, memory, filesystem, image, sockets, platform, input, templates, prefs,
-      start, panel, data, compat, guide, gameApi, metrics, runtime, audit, imageReads,
+      start, panel, data, compat, guide, gameApi, metrics, runtime, audit, imageReads, launcherCredentials,
     ] = await Promise.all([
       import('./graphics.js'),
       import('./audio.js'),
@@ -879,8 +894,10 @@ function runtimeFailedBeforeProof(reason) {
       import('./client-runtime.js'),
       import('./frame-audit.js'),
       import('./image-read-tracking.js'),
+      import('./launcher-credentials.js'),
     ]);
     host = {
+      ...launcherCredentials,
       ...graphics,
       ...audio,
       ...memory,

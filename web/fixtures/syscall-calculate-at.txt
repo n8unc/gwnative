@@ -1,0 +1,23 @@
+// Extracted from official Gw.jspi.js and Gw.js, pinned in README.md.
+// Source SHA-256: Gw.jspi.js 4ee7c8af5aa5f5c2e9a1334642fdc52075464da4d203fc676c7becb31669a2a8
+// Source SHA-256: Gw.js e6d031a22d9047f30a1e2d1d2e25f6daca552df4a5dc1e3fad83b57bf404463c
+calculateAt(dirfd, path, allowEmpty) {
+  if (PATH.isAbs(path)) {
+    return path;
+  }
+  // relative path
+  var dir;
+  if (dirfd === -100) {
+    dir = FS.cwd();
+  } else {
+    var dirstream = SYSCALLS.getStreamFromFD(dirfd);
+    dir = dirstream.path;
+  }
+  if (path.length == 0) {
+    if (!allowEmpty) {
+      throw new FS.ErrnoError(44);;
+    }
+    return dir;
+  }
+  return dir + '/' + path;
+}

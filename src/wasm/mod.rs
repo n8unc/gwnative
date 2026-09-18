@@ -20,6 +20,7 @@
 mod certificate;
 mod codec;
 mod cursor;
+mod launcher_prefill;
 mod rewrite;
 
 use std::collections::BTreeMap;
@@ -106,6 +107,8 @@ struct RuntimeModule {
     template_save: &'static str,
     enhancements: &'static str,
     enhancement_manifest: Option<serde_json::Value>,
+    #[serde(skip)]
+    prepared_transform: bool,
 }
 
 impl RuntimeModule {
@@ -115,6 +118,7 @@ impl RuntimeModule {
             template_save: state,
             enhancements: if enhance { state } else { enhancements::OFF },
             enhancement_manifest: None,
+            prepared_transform: false,
         }
     }
 }
@@ -136,7 +140,7 @@ impl Module {
     pub fn prepared_transforms(&self) -> BTreeMap<String, String> {
         self.runtimes
             .iter()
-            .filter(|(_, module)| module.template_save == "ready")
+            .filter(|(_, module)| module.prepared_transform)
             .filter_map(|(runtime, module)| {
                 module
                     .build
@@ -345,6 +349,46 @@ fn prepare_runtime_inner(
     let glue = fs::read(&glue_path).map_err(|e| format!("{}: {e}", glue_path.display()))?;
     let wasm_hash = digest(&input);
     let glue_hash = digest(&glue);
+    if launcher_prefill::matches(runtime, &wasm_hash, &glue_hash)
+        && feed.select(runtime, &wasm_hash, &glue_hash).is_none()
+    {
+        let output = launcher_prefill::rewrite(runtime, &input, &glue)?
+            .ok_or("launcher-prefill: reviewed pair vanished during rewrite")?;
+        let output_hash = digest(&output);
+        let compatibility_id = runtime_compatibility_id(
+            runtime,
+            &wasm_hash,
+            &glue_hash,
+            launcher_prefill::ABI,
+            Some(&output_hash),
+        );
+        if generations.transform_disabled(runtime.key(), &compatibility_id) {
+            return Ok((
+                None,
+                RuntimeModule::unavailable(Some(compatibility_id), enhancements::FAILED, enhance),
+            ));
+        }
+        let dir = cache_root
+            .join("launcher-prefill")
+            .join(runtime.key())
+            .join(&wasm_hash)
+            .join(launcher_prefill::ABI.to_string());
+        let path = dir.join(runtime.wasm_name());
+        if !fs::read(&path).is_ok_and(|bytes| digest(&bytes) == output_hash) {
+            fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            write_atomic(&path, &output)?;
+        }
+        return Ok((
+            Some(path),
+            RuntimeModule {
+                build: Some(compatibility_id),
+                template_save: enhancements::UNCERTIFIED,
+                enhancements: enhancements::OFF,
+                enhancement_manifest: None,
+                prepared_transform: true,
+            },
+        ));
+    }
     let Some(selected) = feed.select(runtime, &wasm_hash, &glue_hash) else {
         let compatibility_id = runtime_compatibility_id(
             runtime,
@@ -358,7 +402,7 @@ fn prepare_runtime_inner(
             RuntimeModule::unavailable(Some(compatibility_id), enhancements::UNCERTIFIED, enhance),
         ));
     };
-    let compatibility_id = runtime_compatibility_id(
+    let mut compatibility_id = runtime_compatibility_id(
         runtime,
         &wasm_hash,
         &glue_hash,
@@ -372,7 +416,57 @@ fn prepare_runtime_inner(
         ));
     }
 
-    let derived = derive(cache_root, runtime, &input, &selected)?;
+    let mut derived = derive(cache_root, runtime, &input, &selected)?;
+    // A signed template transform stays authoritative when present. Compose
+    // prefill only from its hash-checked output; a changed getter refuses this
+    // optional layer and retains the signed module unchanged.
+    if launcher_prefill::matches(runtime, &wasm_hash, &glue_hash) {
+        let base = fs::read(&derived).map_err(|e| format!("{}: {e}", derived.display()))?;
+        if digest(&base) == selected.runtime.template.output_sha256 {
+            let output = match launcher_prefill::rewrite_certified(runtime, &base, &glue) {
+                Ok(output) => output,
+                Err(reason) => {
+                    note!("[gwnative] {} launcher prefill: {reason}", runtime.key());
+                    None
+                }
+            };
+            if let Some(output) = output {
+                let output_hash = digest(&output);
+                let dir = cache_root
+                    .join("launcher-prefill")
+                    .join(runtime.key())
+                    .join(&wasm_hash)
+                    .join(launcher_prefill::ABI.to_string());
+                let path = dir.join(runtime.wasm_name());
+                if !fs::read(&path).is_ok_and(|bytes| digest(&bytes) == output_hash) {
+                    fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+                    write_atomic(&path, &output)?;
+                }
+                compatibility_id = runtime_compatibility_id(
+                    runtime,
+                    &wasm_hash,
+                    &glue_hash,
+                    launcher_prefill::ABI,
+                    Some(&output_hash),
+                );
+                if generations.transform_disabled(runtime.key(), &compatibility_id) {
+                    note!(
+                        "[gwnative] {} launcher prefill disabled; retaining signed transform",
+                        runtime.key()
+                    );
+                    compatibility_id = runtime_compatibility_id(
+                        runtime,
+                        &wasm_hash,
+                        &glue_hash,
+                        certificate::TRANSFORM_ABI,
+                        Some(&selected.runtime.template.output_sha256),
+                    );
+                } else {
+                    derived = path;
+                }
+            }
+        }
+    }
     let (enhancement_state, manifest) = if !enhance {
         (enhancements::OFF, None)
     } else if !selected.runtime.passive_enhancements {
@@ -398,6 +492,7 @@ fn prepare_runtime_inner(
             template_save: "ready",
             enhancements: enhancement_state,
             enhancement_manifest: manifest,
+            prepared_transform: true,
         },
     ))
 }

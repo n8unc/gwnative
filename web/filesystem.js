@@ -10,15 +10,23 @@ const MOUNT = 'app:';
 const DEPENDENCY = 'gw-persistent-filesystem';
 const SYNC_TIMEOUT_MS = 30_000;
 const REQUIRED_DIRECTORIES = [
+  // openat resolves app:/Gw.dat against cwd /app: before our FS wrapper runs.
+  // Keep that historical path writable on fresh stores as well as old ones.
+  `${MOUNT}/${MOUNT}`,
   `${MOUNT}/Templates/Skills`,
   `${MOUNT}/Templates/Equipment`,
 ];
 
 /** The client is a Windows program at heart and hands down backslash paths. */
-const normalize = (file) =>
-  typeof file === 'string' && file.includes('\\')
+const normalize = (file) => {
+  if (typeof file !== 'string') return file;
+  const path = file.includes('\\')
     ? file.replace(/^\\+/, '').replaceAll('\\', '/')
     : file;
+  if (path === MOUNT) return `/${MOUNT}`;
+  if (path.startsWith(`${MOUNT}/`)) return `/${path}`;
+  return path;
+};
 
 /**
  * Normalize at each public operation rather than only at lookupPath: rename and

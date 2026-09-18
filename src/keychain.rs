@@ -515,6 +515,56 @@ pub fn clear(account: &str) -> Result<bool, String> {
     Ok(replaced)
 }
 
+/// Launcher-owned credential read. This deliberately bypasses `offered` and
+/// `protection`: launcher may manage several accounts in one process, while
+/// those globals represent one game-side credential epoch.
+pub(crate) fn launcher_read(account: &str) -> Result<Option<(String, String)>, String> {
+    let raw = match System(account).get() {
+        Ok(raw) => SecretBuffer::new(raw),
+        Err(error) if error.code() == ITEM_NOT_FOUND => return Ok(None),
+        Err(error) => return Err(format!("the saved login could not be read ({error})")),
+    };
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Wire {
+        username: SecretField,
+        password: SecretField,
+    }
+    let wire: Wire = serde_json::from_slice(raw.as_ref())
+        .map_err(|error| format!("the saved login is invalid ({error})"))?;
+    Ok(Some((wire.username.take(), wire.password.take())))
+}
+
+/// Launcher-owned credential write without changing game-side credential
+/// protection state. Keychain replacement retries after an interaction denial,
+/// matching existing store semantics while never registering a global pair.
+pub(crate) fn launcher_store(account: &str, username: &str, password: &str) -> Result<(), String> {
+    if username.len() > MAX_FIELD || password.len() > MAX_FIELD {
+        return Err("credentials are too long to store".into());
+    }
+    #[derive(Serialize)]
+    struct Wire<'a> {
+        username: &'a str,
+        password: &'a str,
+    }
+    let encoded = SecretBuffer::new(
+        serde_json::to_vec(&Wire { username, password }).map_err(|error| error.to_string())?,
+    );
+    match System(account).set(encoded.as_ref()) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            clear_in(&System(account))?;
+            System(account)
+                .set(encoded.as_ref())
+                .map_err(|error| format!("the saved login could not be stored ({error})"))
+        }
+    }
+}
+
+pub(crate) fn launcher_clear(account: &str) -> Result<(), String> {
+    clear_in(&System(account))
+}
+
 fn clear_in(vault: &impl Vault) -> Result<(), String> {
     match vault.delete() {
         Ok(()) => Ok(()),

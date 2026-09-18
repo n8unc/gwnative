@@ -145,6 +145,8 @@ pub struct Notice {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Invocation {
     pub command: Command,
+    /// Explicit game process. Bare application launches open the account GUI.
+    pub game_mode: bool,
     pub profile: Option<String>,
     pub new_instance: bool,
     pub host_port: Option<u16>,
@@ -168,6 +170,7 @@ impl Default for Invocation {
     fn default() -> Self {
         Self {
             command: Command::Run,
+            game_mode: false,
             profile: None,
             new_instance: false,
             host_port: None,
@@ -188,6 +191,20 @@ impl Default for Invocation {
 }
 
 impl Invocation {
+    pub fn opens_launcher(&self) -> bool {
+        self.command == Command::Run
+            && !self.game_mode
+            && self.profile.is_none()
+            && !self.new_instance
+            && self.web_root.is_none()
+            && self.image_path.is_none()
+            && self.host_port.is_none()
+            && self.cache_root.is_none()
+            && !self.no_prefetch
+            && !self.devtools
+            && self.legacy == LegacyOptions::default()
+    }
+
     /// Move invocation-only credentials to the protected host route.
     ///
     /// They must not be serialized into the document-start launch JSON: a
@@ -263,7 +280,8 @@ Guild Wars — a native macOS host for the Guild Wars client.
 Usage: gwnative [command] [options]
 
 Commands:
-  run                 open the game window (default)
+  (none)              open the account launcher
+  run                 open a game window directly
   sync                download and verify the current client
   repair              verify and repair installed game data
   serve               serve the local origin without a window
@@ -271,6 +289,7 @@ Commands:
   profiles            list launch profiles
 
 Native options:
+  --game              run a game process without opening the launcher
   --profile NAME      use an isolated launch profile
   --new-instance      allow another isolated profile instance
   --host-port PORT    override the profile origin (bypasses its isolation)
@@ -357,7 +376,11 @@ where
                     _ => unreachable!(),
                 };
                 set_command(&mut invocation, &mut command_seen, command, option)?;
+                if command == Command::Run {
+                    invocation.game_mode = true;
+                }
             }
+            "--game" => no_inline(option, inline, || invocation.game_mode = true)?,
             "--profile" => {
                 let value = take_value(&args, &mut index, option, inline)?;
                 validate_profile(value)?;
@@ -628,6 +651,7 @@ where
         ));
     }
     if invocation.new_instance
+        && !invocation.game_mode
         && invocation
             .profile
             .as_deref()
@@ -851,6 +875,23 @@ fn value_error(option: &str, reason: &str) -> Exit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launcher_is_default_but_explicit_game_and_tools_keep_their_routes() {
+        assert!(parse_str(&[]).unwrap().opens_launcher());
+        assert!(parse_str(&["--offline"]).unwrap().opens_launcher());
+        for args in [
+            vec!["run"],
+            vec!["--game"],
+            vec!["--profile", "default"],
+            vec!["profiles"],
+            vec!["sync"],
+            vec!["--host-port", "38111"],
+        ] {
+            assert!(!parse_str(&args).unwrap().opens_launcher(), "{args:?}");
+        }
+        assert!(parse_str(&["--game", "--profile", "default", "--new-instance"]).is_ok());
+    }
 
     fn parse_str(args: &[&str]) -> Result<Invocation, Exit> {
         parse(args.iter().copied())

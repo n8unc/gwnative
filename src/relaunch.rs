@@ -116,10 +116,16 @@ fn start_with_options(renderer_recovery: bool, refresh_client: bool) -> Result<(
         // user, settings, runtime, or renderer restart.
         command.env_remove(CLIENT_REFRESH);
     }
-    command
+    let mut child = command
         .spawn()
-        .map(|child| note!("[relaunch] started pid {}", child.id()))
-        .map_err(|e| format!("{} could not be started: {e}", exe.display()))
+        .map_err(|e| format!("{} could not be started: {e}", exe.display()))?;
+    if let Err(error) = crate::launcher_sessions::commit_relaunch(child.id()) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    note!("[relaunch] started pid {}", child.id());
+    Ok(())
 }
 
 /// Carry launch behavior forward without copying invocation credentials into a

@@ -68,6 +68,24 @@ class FakeAudioContext extends EventTarget {
   }
 }
 
+class ListenerTarget extends EventTarget {
+  constructor() {
+    super();
+    this.added = 0;
+    this.removed = 0;
+  }
+
+  addEventListener(...args) {
+    this.added += 1;
+    return super.addEventListener(...args);
+  }
+
+  removeEventListener(...args) {
+    this.removed += 1;
+    return super.removeEventListener(...args);
+  }
+}
+
 /** The one context the client is currently using. */
 const current = () => FakeAudioContext.built.at(-1);
 
@@ -84,10 +102,23 @@ describe('game audio', () => {
     globalThis.addEventListener ??= () => {};
     globalThis.window = globalThis;
     globalThis.navigator ??= {};
+    globalThis.document = new ListenerTarget();
+    globalThis.document.canvas = new ListenerTarget();
+    globalThis.document.getElementById = (id) => id === 'canvas' ? globalThis.document.canvas : null;
     globalThis.AudioContext = FakeAudioContext;
+    globalThis.autoResumeAudioContext = (ctx) => {
+      for (const event of ['keydown', 'mousedown', 'touchstart']) {
+        for (const element of [document, document.getElementById('canvas')]) {
+          element?.addEventListener(event, () => {
+            if (ctx.state === 'suspended') ctx.resume();
+          }, { once: true });
+        }
+      }
+    };
 
     audio = await import('./audio.js');
     audio.installGameAudio();
+    audio.installGameAudioResumeLifecycle();
   });
 
   beforeEach(() => {
@@ -156,6 +187,32 @@ describe('game audio', () => {
 
     assert.equal(abandoned.closed, true, 'the glue never closes it, so this must');
     assert.equal(replacement.closed, false);
+  });
+
+  it('removes generated resume listeners when a context becomes stale', (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const abandoned = new globalThis.AudioContext();
+    abandoned.state = 'suspended';
+    autoResumeAudioContext(abandoned);
+    const replacement = new globalThis.AudioContext();
+    replacement.state = 'suspended';
+    autoResumeAudioContext(replacement);
+    assert.equal(document.added + document.canvas.added, 12);
+
+    t.mock.timers.tick(5000);
+
+    assert.equal(document.removed + document.canvas.removed, 6);
+    assert.equal(replacement.closed, false);
+  });
+
+  it('removes listeners when context closes outside stale cleanup', () => {
+    const context = new globalThis.AudioContext();
+    context.state = 'suspended';
+    autoResumeAudioContext(context);
+    assert.equal(document.added + document.canvas.added, 18);
+    context.state = 'closed';
+    context.dispatchEvent(new Event('statechange'));
+    assert.equal(document.removed + document.canvas.removed, 12);
   });
 
   it('mutes every context the client is still holding', (t) => {

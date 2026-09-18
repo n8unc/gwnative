@@ -24,6 +24,7 @@ const NAME_LIMIT = 260;
 
 const PATH_LIMIT = 260;
 const ERROR_NOT_FOUND = 2;
+const UINT32_MAX = 0xffffffff;
 
 // Entry kinds the client asks for. `Templates/Skills/*.txt` is requested with
 // FILES and `Templates/Skills/*` with DIRECTORIES, so answering both with files
@@ -167,7 +168,7 @@ function matchingEntries(fs, directory, pattern, flags) {
  * @param {{
  *   imports: { env?: Record<string, Function> },
  *   module: { HEAPU8?: Uint8Array },
- *   exports: () => { malloc?: (bytes: number) => number } | null | undefined,
+ *   exports: () => { malloc?: (bytes: number) => number, free?: (pointer: number) => void } | null | undefined,
  *   log: (...values: unknown[]) => void,
  * }} options
  */
@@ -217,26 +218,37 @@ export function installTemplateSave({ imports, module, exports, log }) {
     }
     if (names.length === 0) return 0;
 
-    const malloc = exports()?.malloc;
-    if (typeof malloc !== 'function') return 0;
-    const entries = malloc(names.length * RECORD_BYTES);
-    if (!entries) return 0;
-
-    // malloc can grow memory, so every view is taken after it returns.
-    const heap = module.HEAPU8;
-    if (!heap) return 0;
-    heap.fill(0, entries, entries + names.length * RECORD_BYTES);
-    names.forEach((name, index) => {
-      writeWide(
-        module,
-        entries + index * RECORD_BYTES + RECORD_NAME_OFFSET,
-        name,
-        NAME_LIMIT,
-      );
-    });
-    const words = new Uint32Array(heap.buffer);
-    words[out >>> 2] = entries;
-    words[(out >>> 2) + 2] = names.length;
+    const allocationBytes = names.length * RECORD_BYTES;
+    if (!Number.isSafeInteger(allocationBytes)) return 0;
+    const allocation = exports?.();
+    const malloc = allocation?.malloc;
+    const free = allocation?.free;
+    if (typeof malloc !== 'function' || typeof free !== 'function') return 0;
+    const initialHeap = module.HEAPU8;
+    if (!initialHeap || out > initialHeap.byteLength - 12) return 0;
+    let entries = 0;
+    let published = false;
+    try {
+      const pointer = Number(malloc(allocationBytes));
+      if (!Number.isSafeInteger(pointer) || pointer <= 0 || pointer > UINT32_MAX || pointer + allocationBytes > UINT32_MAX) return 0;
+      entries = pointer;
+      const heap = module.HEAPU8;
+      if (!heap || entries > heap.byteLength || allocationBytes > heap.byteLength - entries) return 0;
+      heap.fill(0, entries, entries + allocationBytes);
+      names.forEach((name, index) => {
+        if (!writeWide(module, entries + index * RECORD_BYTES + RECORD_NAME_OFFSET, name, NAME_LIMIT)) throw new RangeError('template record outside heap');
+      });
+      const finalHeap = module.HEAPU8;
+      if (!finalHeap || out > finalHeap.byteLength - 12 || entries > finalHeap.byteLength || allocationBytes > finalHeap.byteLength - entries) return 0;
+      const words = new Uint32Array(finalHeap.buffer);
+      words[out >>> 2] = entries;
+      words[(out >>> 2) + 2] = names.length;
+      published = true;
+    } catch {
+      return 0;
+    } finally {
+      if (entries && !published) free(entries);
+    }
     diagnostics.count('gw.template.listed', names.length);
     return 0;
   };
